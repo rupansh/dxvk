@@ -93,6 +93,17 @@ d3d11_dep = declare_dependency(
   include_directories : [ dxvk_include_path ],
 )
 
+# Helios: static archive of the full D3D11 COM implementation so the Helios WDDM
+# UMD (helios_umd.dll) can instantiate D3D11DXGIDevice from a DxvkDevice and
+# forward the d3d10umddi DDI to it. Links the system dxgi/gdi32 at the UMD's final
+# link (static libs don't resolve their own externs).
+helios_d3d11_static = static_library('helios_d3d11_static',
+    dxgi_common_src + d3d11_src + d3d10_src,
+    glsl_generator.process(d3d11_shaders),
+  dependencies        : d3d11_dxgi_deps + [ dxvk_dep, dxbc_spirv_dep ],
+  include_directories : dxvk_include_path,
+)
+
 if platform != 'windows'
   pkg.generate(d3d11_dll,
     filebase: dxvk_pkg_prefix + 'd3d11',
