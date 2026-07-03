@@ -6,7 +6,7 @@ namespace dxvk {
   DxvkFence::DxvkFence(
           DxvkDevice*           device,
     const DxvkFenceCreateInfo&  info)
-  : m_vkd(device->vkd()), m_info(info) {
+  : m_vkd(device->vkd()), m_info(info), m_kmtDevice(device->kmtLocal()) {
     VkSemaphoreTypeCreateInfo typeInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
     typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     typeInfo.initialValue = info.initialValue;
@@ -177,6 +177,11 @@ namespace dxvk {
     if (m_info.sharedType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FLAG_BITS_MAX_ENUM)
       return INVALID_HANDLE_VALUE;
 
+    if (!m_vkd->vkGetSemaphoreWin32HandleKHR) {
+      Logger::warn("DxvkFence::sharedHandle: vkGetSemaphoreWin32HandleKHR unavailable");
+      return INVALID_HANDLE_VALUE;
+    }
+
     VkSemaphoreGetWin32HandleInfoKHR win32HandleInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR };
     win32HandleInfo.semaphore = m_semaphore;
     win32HandleInfo.handleType = m_info.sharedType;
@@ -193,6 +198,11 @@ namespace dxvk {
 
   void DxvkFence::initKmtHandles() {
 #ifdef _WIN32
+    if (!m_vkd->vkGetSemaphoreWin32HandleKHR) {
+      Logger::warn("DxvkFence::initKmtHandles: vkGetSemaphoreWin32HandleKHR unavailable");
+      return;
+    }
+
     VkSemaphoreGetWin32HandleInfoKHR win32HandleInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR };
     win32HandleInfo.semaphore = m_semaphore;
     win32HandleInfo.handleType = m_info.sharedType;
@@ -212,13 +222,26 @@ namespace dxvk {
         m_kmtGlobal = desc.hSharedHandle;
       }
     } else {
-      D3DKMT_OPENSYNCOBJECTFROMNTHANDLE desc = { };
-      desc.hNtHandle = sharedHandle;
+      D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 desc2 = { };
+      desc2.hNtHandle = sharedHandle;
+      desc2.hDevice = m_kmtDevice;
 
-      if (D3DKMTOpenSyncObjectFromNtHandle(&desc)) {
-        Logger::warn("DxvkFence::DxvkFence: Failed to open shared NT handle");
+      NTSTATUS status = m_kmtDevice
+        ? D3DKMTOpenSyncObjectFromNtHandle2(&desc2)
+        : STATUS_INVALID_PARAMETER;
+
+      if (!status) {
+        m_kmtLocal = desc2.hSyncObject;
       } else {
-        m_kmtLocal = desc.hSyncObject;
+        D3DKMT_OPENSYNCOBJECTFROMNTHANDLE desc = { };
+        desc.hNtHandle = sharedHandle;
+
+        status = D3DKMTOpenSyncObjectFromNtHandle(&desc);
+        if (status) {
+          Logger::warn(str::format("DxvkFence::DxvkFence: Failed to open shared NT handle: ", status));
+        } else {
+          m_kmtLocal = desc.hSyncObject;
+        }
       }
       CloseHandle(sharedHandle);
     }

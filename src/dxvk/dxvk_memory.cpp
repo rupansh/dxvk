@@ -275,7 +275,7 @@ namespace dxvk {
 
 
   DxvkResourceAllocation::~DxvkResourceAllocation() {
-    if (unlikely(m_kmtLocal)) {
+    if (unlikely(m_kmtLocal && m_ownsKmtHandles)) {
       D3DKMT_DESTROYALLOCATION destroy = { };
       destroy.hDevice = m_allocator->device()->kmtLocal();
       destroy.hResource = m_kmtLocal;
@@ -332,8 +332,21 @@ namespace dxvk {
 
   void DxvkResourceAllocation::initKmtHandles(VkExternalMemoryHandleTypeFlagBits handleType) {
 #ifdef _WIN32
+    if (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BITS_MAX_ENUM)
+      return;
+
     auto device = m_allocator->device();
     auto vk = device->vkd();
+
+    if (!device->kmtLocal()) {
+      Logger::warn("DxvkResourceAllocation::initKmtHandles: No local D3DKMT device");
+      return;
+    }
+
+    if (!vk->vkGetMemoryWin32HandleKHR) {
+      Logger::warn("DxvkResourceAllocation::initKmtHandles: vkGetMemoryWin32HandleKHR unavailable");
+      return;
+    }
 
     VkMemoryGetWin32HandleInfoKHR handleInfo = { VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR };
     handleInfo.handleType = handleType;
@@ -344,6 +357,8 @@ namespace dxvk {
 
     if (vk->vkGetMemoryWin32HandleKHR(vk->device(), &handleInfo, &sharedHandle) != VK_SUCCESS) {
       Logger::warn("DxvkMemoryAllocator::createImageResource: Failed to get shared handle for memory");
+    } else if (sharedHandle == INVALID_HANDLE_VALUE || sharedHandle == nullptr) {
+      Logger::warn("DxvkMemoryAllocator::createImageResource: Invalid shared handle for memory");
     } else if (handleInfo.handleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT) {
       D3DKMT_OPENRESOURCE open = { };
       open.hDevice = device->kmtLocal();
@@ -356,6 +371,7 @@ namespace dxvk {
       } else {
         m_kmtLocal = open.hResource;
         m_kmtGlobal = open.hGlobalShare;
+        m_ownsKmtHandles = true;
       }
     } else {
       D3DKMT_OPENRESOURCEFROMNTHANDLE open = { };
@@ -374,6 +390,7 @@ namespace dxvk {
         Logger::warn("DxvkMemoryAllocator::createImageResource: Failed to open shared NT handle");
       } else {
         m_kmtLocal = open.hResource;
+        m_ownsKmtHandles = true;
 
         if (open.hKeyedMutex) {
           Logger::warn(str::format("DxvkMemoryAllocator::createImageResource: Unexpected bundled keyed mutex"));
@@ -1137,7 +1154,7 @@ namespace dxvk {
     vk->vkGetImageMemoryRequirements2(vk->device(), &requirementInfo, &requirements);
 
     // For shared resources, we always require a dedicated allocation
-    if (next) {
+    if (next || allocationInfo.forceDedicated) {
       dedicatedRequirements.requiresDedicatedAllocation = VK_TRUE;
       dedicatedRequirements.prefersDedicatedAllocation = VK_TRUE;
     }

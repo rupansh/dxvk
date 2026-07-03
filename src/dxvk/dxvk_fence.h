@@ -137,6 +137,7 @@ namespace dxvk {
     Rc<vk::DeviceFn>                m_vkd;
     DxvkFenceCreateInfo             m_info;
     VkSemaphore                     m_semaphore;
+    D3DKMT_HANDLE                   m_kmtDevice = 0;
     D3DKMT_HANDLE                   m_kmtLocal = 0;
     D3DKMT_HANDLE                   m_kmtGlobal = 0;
 

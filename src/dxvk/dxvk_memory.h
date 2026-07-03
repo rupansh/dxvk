@@ -574,6 +574,17 @@ namespace dxvk {
     }
 
     /**
+     * \brief Sets externally-created D3DKMT resource handles
+     */
+    void setKmtHandles(
+            D3DKMT_HANDLE           local,
+            D3DKMT_HANDLE           global) {
+      m_kmtLocal = local;
+      m_kmtGlobal = global;
+      m_ownsKmtHandles = false;
+    }
+
+    /**
      * \brief Queries memory info
      * \returns Memory info
      */
@@ -669,6 +680,7 @@ namespace dxvk {
     DxvkResourceImageViewMap*   m_imageViews = nullptr;
     D3DKMT_HANDLE               m_kmtLocal = 0;
     D3DKMT_HANDLE               m_kmtGlobal = 0;
+    bool                        m_ownsKmtHandles = false;
 
     DxvkSparsePageTable*        m_sparsePageTable = nullptr;
 
@@ -1020,6 +1032,8 @@ namespace dxvk {
     DxvkAllocationModes mode = 0u;
     /// Shared handle type
     VkExternalMemoryHandleTypeFlagBits handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BITS_MAX_ENUM;
+    /// Force a dedicated VkDeviceMemory allocation even without Vulkan external-memory pNexts.
+    bool forceDedicated = false;
   };
 
 

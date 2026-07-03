@@ -32,6 +32,20 @@ namespace dxvk {
 
     // Create and assign actual buffer resource
     assignStorage(allocateStorage());
+
+    // Helios: createBufferResource returns null (rather than throwing) when
+    // the backing memory allocation fails — e.g. a memory type without a
+    // global buffer, or the venus/host side refusing the allocation. A
+    // storage-less buffer is a time bomb (null-deref at first use, which is
+    // NOT a DxvkError and AV'd dwm); fail creation cleanly instead so the
+    // caller's catch(DxvkError) net turns it into the handled error path.
+    // Mirrors the DxvkImage ctor. Unregister first: a throwing ctor never
+    // runs ~DxvkBuffer, which would leave a dangling pointer in the
+    // allocator's resource map.
+    if (m_storage == nullptr) {
+      m_allocator->unregisterResource(this);
+      throw DxvkError("DxvkBuffer: failed to allocate backing storage");
+    }
   }
 
 
@@ -60,6 +74,13 @@ namespace dxvk {
     m_sharingMode.fill(info);
 
     assignStorage(allocator.importBufferResource(info, allocationInfo, importInfo));
+
+    // Helios: same null-storage contract as the allocating ctor above — a
+    // failed import must surface as DxvkError, not a later null-deref AV.
+    if (m_storage == nullptr) {
+      m_allocator->unregisterResource(this);
+      throw DxvkError("DxvkBuffer: failed to import backing storage");
+    }
   }
 
 
