@@ -9,6 +9,11 @@ namespace dxvk {
     return -1;
   }
 
+  NTSTATUS WINAPI D3DKMTAcquireKeyedMutex2(D3DKMT_ACQUIREKEYEDMUTEX2 *desc) {
+    Logger::warn("D3DKMTAcquireKeyedMutex2: Not available on this platform.");
+    return -1;
+  }
+
   NTSTATUS D3DKMTCloseAdapter(const D3DKMT_CLOSEADAPTER *desc) {
     Logger::warn("D3DKMTCloseAdapter: Not available on this platform.");
     return -1;
@@ -69,6 +74,16 @@ namespace dxvk {
     return -1;
   }
 
+  NTSTATUS D3DKMTOpenKeyedMutex2(D3DKMT_OPENKEYEDMUTEX2 *desc) {
+    Logger::warn("D3DKMTOpenKeyedMutex2: Not available on this platform.");
+    return -1;
+  }
+
+  NTSTATUS D3DKMTOpenKeyedMutexFromNtHandle(D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE *desc) {
+    Logger::warn("D3DKMTOpenKeyedMutexFromNtHandle: Not available on this platform.");
+    return -1;
+  }
+
   NTSTATUS D3DKMTOpenResource2(D3DKMT_OPENRESOURCE *desc) {
     Logger::warn("D3DKMTOpenResource2: Not available on this platform.");
     return -1;
@@ -89,6 +104,11 @@ namespace dxvk {
     return -1;
   }
 
+  NTSTATUS WINAPI D3DKMTOpenSyncObjectFromNtHandle2(D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *desc) {
+    Logger::warn("D3DKMTOpenSyncObjectFromNtHandle2: Not available on this platform.");
+    return -1;
+  }
+
   NTSTATUS D3DKMTQueryResourceInfo(D3DKMT_QUERYRESOURCEINFO *desc) {
     Logger::warn("D3DKMTQueryResourceInfo: Not available on this platform.");
     return -1;
@@ -101,6 +121,11 @@ namespace dxvk {
 
   NTSTATUS WINAPI D3DKMTReleaseKeyedMutex(D3DKMT_RELEASEKEYEDMUTEX *desc) {
     Logger::warn("D3DKMTReleaseKeyedMutex: Not available on this platform.");
+    return -1;
+  }
+
+  NTSTATUS WINAPI D3DKMTReleaseKeyedMutex2(D3DKMT_RELEASEKEYEDMUTEX2 *desc) {
+    Logger::warn("D3DKMTReleaseKeyedMutex2: Not available on this platform.");
     return -1;
   }
 
@@ -122,6 +147,19 @@ namespace dxvk {
     return func(desc);
   }
 
+  static NTSTATUS WINAPI NoD3DKMTAcquireKeyedMutex2(D3DKMT_ACQUIREKEYEDMUTEX2 *desc) {
+    return -1;
+  }
+
+  NTSTATUS WINAPI D3DKMTAcquireKeyedMutex2(D3DKMT_ACQUIREKEYEDMUTEX2 *desc) {
+    static decltype(D3DKMTAcquireKeyedMutex2) *func;
+    if (!func) {
+      InterlockedCompareExchangePointer((void **)&func, (void *)GetProcAddress(GetModuleHandle("gdi32"), "D3DKMTAcquireKeyedMutex2"), NULL);
+      InterlockedCompareExchangePointer((void **)&func, (void *)NoD3DKMTAcquireKeyedMutex2, NULL);
+    }
+    return func(desc);
+  }
+
   static NTSTATUS WINAPI NoD3DKMTReleaseKeyedMutex(D3DKMT_RELEASEKEYEDMUTEX *desc) {
     return -1;
   }
@@ -134,5 +172,19 @@ namespace dxvk {
     }
     return func(desc);
   }
+
+  static NTSTATUS WINAPI NoD3DKMTReleaseKeyedMutex2(D3DKMT_RELEASEKEYEDMUTEX2 *desc) {
+    return -1;
+  }
+
+  NTSTATUS WINAPI D3DKMTReleaseKeyedMutex2(D3DKMT_RELEASEKEYEDMUTEX2 *desc) {
+    static decltype(D3DKMTReleaseKeyedMutex2) *func;
+    if (!func) {
+      InterlockedCompareExchangePointer((void **)&func, (void *)GetProcAddress(GetModuleHandle("gdi32"), "D3DKMTReleaseKeyedMutex2"), NULL);
+      InterlockedCompareExchangePointer((void **)&func, (void *)NoD3DKMTReleaseKeyedMutex2, NULL);
+    }
+    return func(desc);
+  }
+
 #endif
 }

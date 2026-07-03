@@ -301,6 +301,16 @@ namespace dxvk {
      * \returns Previous buffer allocation
      */
     Rc<DxvkResourceAllocation> assignStorage(Rc<DxvkResourceAllocation>&& slice) {
+      // Helios: never assign null storage — the getBufferInfo() deref below is
+      // a plain null-deref (not a C++ exception), so it escapes the
+      // catch(DxvkError) net and AVs the process (observed: dwm, dumps in
+      // C:\HeliosDumps). Mirrors DxvkImage::assignStorageWithUsage. Keep the
+      // current storage and hand back nothing for the caller to destroy.
+      if (slice == nullptr) {
+        Logger::err("DxvkBuffer::assignStorage: null storage, ignoring assignment");
+        return nullptr;
+      }
+
       Rc<DxvkResourceAllocation> result = std::move(m_storage);
 
       m_storage = std::move(slice);

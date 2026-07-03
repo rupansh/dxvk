@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include <dxbc/dxbc_container.h>
@@ -34,6 +35,13 @@
 #include "../util/util_shared_res.h"
 
 namespace dxvk {
+
+  namespace {
+    bool heliosKmtOnlySharedResources() {
+      const char* value = std::getenv("HELIOS_DXVK_KMT_SHARED");
+      return value && value[0] == '1' && value[1] == '\0';
+    }
+  }
   
   constexpr uint32_t D3D11DXGIDevice::DefaultFrameLatency;
 
@@ -1517,6 +1525,11 @@ namespace dxvk {
       }
     }
 
+    if (heliosKmtOnlySharedResources()) {
+      Logger::warn("D3D11Device::OpenSharedResource: D3DKMT open failed in Helios KMT mode");
+      return E_INVALIDARG;
+    }
+
     /* try the legacy Proton shared resource implementation */
     return OpenSharedResourceGeneric<true>(
       hResource, ReturnedInterface, ppResource);
@@ -1575,10 +1588,14 @@ namespace dxvk {
         if (open.hSyncObject) {
 #ifdef _WIN32
           DxvkFenceCreateInfo fenceInfo = { };
+          OBJECT_ATTRIBUTES attr = { };
+          attr.Length = sizeof(attr);
 
           /* need to create a NT shared handle again to import the fence from it */
-          if (D3DKMTShareObjects(1, &open.hSyncObject, NULL, GENERIC_ALL, &fenceInfo.sharedHandle))
-            Logger::warn(str::format("D3D11Device::OpenSharedResource1: Failed to open sync object"));
+          NTSTATUS syncShareStatus =
+            D3DKMTShareObjects(1, &open.hSyncObject, &attr, GENERIC_ALL, &fenceInfo.sharedHandle);
+          if (syncShareStatus)
+            Logger::warn(str::format("D3D11Device::OpenSharedResource1: Failed to share sync object: ", syncShareStatus));
           else {
             fenceInfo.sharedType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
             fence = m_dxvkDevice->createFence(fenceInfo);
@@ -1613,6 +1630,11 @@ namespace dxvk {
           return E_INVALIDARG;
         }
       }
+    }
+
+    if (heliosKmtOnlySharedResources()) {
+      Logger::warn("D3D11Device::OpenSharedResource1: D3DKMT open failed in Helios KMT mode");
+      return E_INVALIDARG;
     }
 
     /* try the legacy Proton shared resource implementation */

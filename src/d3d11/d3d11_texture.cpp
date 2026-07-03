@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 #include "d3d11_device.h"
 #include "d3d11_context_imm.h"
 #include "d3d11_gdi.h"
@@ -7,6 +9,13 @@
 #include "../util/util_win32_compat.h"
 
 namespace dxvk {
+
+  namespace {
+    bool heliosKmtOnlySharedResources() {
+      const char* value = std::getenv("HELIOS_DXVK_KMT_SHARED");
+      return value && value[0] == '1' && value[1] == '\0';
+    }
+  }
   
   D3D11CommonTexture::D3D11CommonTexture(
           ID3D11Resource*             pInterface,
@@ -732,6 +741,16 @@ namespace dxvk {
   
   
   void D3D11CommonTexture::ExportImageInfo() {
+    // Helios: a shared texture whose storage/export path failed upstream (for
+    // example the host refusing the memory-export blob) can reach here without
+    // backing storage; the storage()/sharedHandle() derefs below then AV
+    // (observed live: DWM crash loop at ExportImageInfo+0x338). Exporting is
+    // meaningless without storage — degrade to no-export instead of crashing.
+    if (m_image == nullptr || m_image->storage() == nullptr) {
+      Logger::warn("D3D11CommonTexture::ExportImageInfo: image has no storage, skipping export");
+      return;
+    }
+
     struct d3dkmt_d3d11_desc desc = { };
     desc.dxgi.size = sizeof(desc);
     desc.dxgi.version = 4;
@@ -741,7 +760,9 @@ namespace dxvk {
 
     if (desc.dxgi.keyed_mutex) {
       auto keyedMutex = m_image->getKeyedMutex();
-      desc.dxgi.mutex_handle = keyedMutex ? keyedMutex->kmtGlobal() : 0;
+      desc.dxgi.mutex_handle = keyedMutex
+        ? (heliosKmtOnlySharedResources() ? keyedMutex->kmtLocal() : keyedMutex->kmtGlobal())
+        : 0;
 
       if (keyedMutex) {
         auto syncObject = keyedMutex->getSyncObject();
@@ -786,6 +807,9 @@ namespace dxvk {
         desc.d3d11_3d.MiscFlags = m_desc.MiscFlags;
         break;
     }
+
+    if (heliosKmtOnlySharedResources() && m_image->storage()->kmtLocal())
+      return;
 
     D3DKMT_ESCAPE escape = { };
     escape.Type = D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE;

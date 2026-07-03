@@ -2,7 +2,25 @@
 
 #include "dxvk_device.h"
 
+#include <cstdlib>
+
 namespace dxvk {
+
+  typedef struct VkImportMemoryResourceInfoMESA {
+    VkStructureType sType;
+    const void* pNext;
+    uint32_t resourceId;
+  } VkImportMemoryResourceInfoMESA;
+
+  constexpr VkStructureType VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA_HELIOS =
+    VkStructureType(1000384002);
+  
+  namespace {
+    bool heliosKmtOnlySharedResources() {
+      const char* value = std::getenv("HELIOS_DXVK_KMT_SHARED");
+      return value && value[0] == '1' && value[1] == '\0';
+    }
+  }
   
   DxvkKeyedMutex::DxvkKeyedMutex(
       const Rc<DxvkDevice>& device,
@@ -21,7 +39,8 @@ namespace dxvk {
     D3DKMT_CREATEKEYEDMUTEX2 create = { };
     create.Flags.NtSecuritySharing = ntShared;
     create.InitialValue = initialValue;
-    if (D3DKMTCreateKeyedMutex2(&create))
+    NTSTATUS createStatus = D3DKMTCreateKeyedMutex2(&create);
+    if (createStatus)
       throw DxvkError("DxvkKeyedMutex: Failed to create mutex");
 
     m_kmtLocal = create.hKeyedMutex;
@@ -38,8 +57,6 @@ namespace dxvk {
     m_fence(fence),
     m_kmtLocal(kmtLocal),
     m_kmtGlobal(kmtGlobal) {
-    if (!fence)
-      Logger::err("DxvkKeyedMutex::DxvkKeyedMutex: No fence provided");
   }
 
     
@@ -51,33 +68,42 @@ namespace dxvk {
     }
   }
 
+  bool DxvkKeyedMutex::hasVulkanSyncObject() const {
+    return m_fence != nullptr && m_fence->kmtLocal() != 0;
+  }
 
   HRESULT DxvkKeyedMutex::AcquireSync(UINT64 key, DWORD  milliseconds) {
-    if (m_owned.load(std::memory_order_acquire))
+    if (m_owned.load(std::memory_order_acquire)) {
       return DXGI_ERROR_INVALID_CALL;
+    }
 
     LARGE_INTEGER timeout = { };
-    D3DKMT_ACQUIREKEYEDMUTEX acquire = { };
+    D3DKMT_ACQUIREKEYEDMUTEX2 acquire = { };
     acquire.hKeyedMutex = m_kmtLocal;
     acquire.Key = key;
     acquire.pTimeout = &timeout;
     timeout.QuadPart = milliseconds * -10000;
 
-    NTSTATUS status = D3DKMTAcquireKeyedMutex(&acquire);
+    NTSTATUS status = D3DKMTAcquireKeyedMutex2(&acquire);
     if (status == STATUS_TIMEOUT)
       return WAIT_TIMEOUT;
-    if (status)
+    if (status) {
+      Logger::warn("DxvkKeyedMutex::AcquireSync: D3DKMTAcquireKeyedMutex2 failed");
       return DXGI_ERROR_INVALID_CALL;
+    }
 
-    VkSemaphore semaphore = m_fence->handle();
-    VkSemaphoreWaitInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-    info.semaphoreCount = 1;
-    info.pSemaphores = &semaphore;
-    info.pValues = &acquire.FenceValue;
+    if (hasVulkanSyncObject()) {
+      VkSemaphore semaphore = m_fence->handle();
+      VkSemaphoreWaitInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+      info.semaphoreCount = 1;
+      info.pSemaphores = &semaphore;
+      info.pValues = &acquire.FenceValue;
 
-    if (m_vkd->vkWaitSemaphores(m_vkd->device(), &info, -1)) {
-      Logger::warn("DxvkKeyedMutex::AcquireSync: Failed to wait semaphore");
-      return DXGI_ERROR_INVALID_CALL;
+      VkResult waitVr = m_vkd->vkWaitSemaphores(m_vkd->device(), &info, -1);
+      if (waitVr) {
+        Logger::warn("DxvkKeyedMutex::AcquireSync: Failed to wait semaphore");
+        return DXGI_ERROR_INVALID_CALL;
+      }
     }
 
     m_fenceValue = acquire.FenceValue;
@@ -87,28 +113,36 @@ namespace dxvk {
 
 
   HRESULT DxvkKeyedMutex::ReleaseSync(UINT64 key) {
-    if (!m_owned.load(std::memory_order_acquire))
-      return DXGI_ERROR_INVALID_CALL;
-
-    VkSemaphoreSignalInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
-    info.semaphore = m_fence->handle();
-    info.value = m_fenceValue + 1;
-
-    if (m_vkd->vkSignalSemaphore(m_vkd->device(), &info)) {
-      Logger::warn("D3D11DXGIKeyedMutex::ReleaseSync: Failed to signal semaphore");
+    if (!m_owned.load(std::memory_order_acquire)) {
       return DXGI_ERROR_INVALID_CALL;
     }
 
-    D3DKMT_RELEASEKEYEDMUTEX release = { };
+    const uint64_t nextFenceValue = m_fenceValue + 1;
+
+    D3DKMT_RELEASEKEYEDMUTEX2 release = { };
     release.hKeyedMutex = m_kmtLocal;
     release.Key = key;
-    release.FenceValue = m_fenceValue + 1;
+    release.FenceValue = nextFenceValue;
 
-    if (D3DKMTReleaseKeyedMutex(&release)) {
-      Logger::warn("D3D11DXGIKeyedMutex::ReleaseSync: Failed to release mutex.");
+    NTSTATUS releaseStatus = D3DKMTReleaseKeyedMutex2(&release);
+    if (releaseStatus) {
+      Logger::warn("D3D11DXGIKeyedMutex::ReleaseSync: D3DKMTReleaseKeyedMutex2 failed.");
       return DXGI_ERROR_INVALID_CALL;
     }
 
+    if (hasVulkanSyncObject()) {
+      VkSemaphoreSignalInfo info = { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+      info.semaphore = m_fence->handle();
+      info.value = nextFenceValue;
+
+      VkResult signalVr = m_vkd->vkSignalSemaphore(m_vkd->device(), &info);
+      if (signalVr) {
+        Logger::warn("D3D11DXGIKeyedMutex::ReleaseSync: Failed to signal semaphore");
+        return DXGI_ERROR_INVALID_CALL;
+      }
+    }
+
+    m_fenceValue = nextFenceValue;
     m_owned.store(false, std::memory_order_release);
     return S_OK;
   }
@@ -158,6 +192,18 @@ namespace dxvk {
       ? m_info.initialLayout : m_info.layout;
 
     assignStorage(allocateStorage());
+
+    // Helios: createImageResource returns null (rather than throwing) when the
+    // backing memory allocation fails — e.g. the venus/host side refusing the
+    // export-memory blob. A storage-less image is a time bomb (AVs at
+    // ExportImageInfo/initImage/assignStorage); fail creation cleanly instead
+    // so D3D11CreateTexture2D returns an error the runtime already handles.
+    // Unregister first: a throwing ctor never runs ~DxvkImage, which would
+    // leave a dangling pointer in the allocator's resource map.
+    if (m_storage == nullptr) {
+      m_allocator->unregisterResource(this);
+      throw DxvkError("DxvkImage: failed to allocate backing storage");
+    }
   }
 
 
@@ -204,7 +250,16 @@ namespace dxvk {
     if (!m_shared)
       return INVALID_HANDLE_VALUE;
 
+    if (heliosKmtOnlySharedResources()) {
+      return INVALID_HANDLE_VALUE;
+    }
+
 #ifdef _WIN32
+    if (!m_vkd->vkGetMemoryWin32HandleKHR) {
+      Logger::warn("DxvkImage::sharedHandle: vkGetMemoryWin32HandleKHR unavailable");
+      return INVALID_HANDLE_VALUE;
+    }
+
     DxvkResourceMemoryInfo memoryInfo = m_storage->getMemoryInfo();
 
     VkMemoryGetWin32HandleInfoKHR handleInfo = { VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR };
@@ -305,12 +360,26 @@ namespace dxvk {
     if ((m_info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && formatList.viewFormatCount)
       formatList.pNext = std::exchange(imageInfo.pNext, &formatList);
 
+    // Helios gets WDDM allocation/resource KMT handles from d3d10umddi and
+    // stamps them into DXVK after resource creation. Venus does not expose
+    // VK_KHR_external_memory_win32 in this bridge mode, but virglrenderer will
+    // only bind a VkDeviceMemory to a HOST3D blob if that memory was allocated
+    // as exportable. Use Venus' renderer-side opaque-fd handle type for the
+    // Vulkan pNext chain while suppressing DXVK's Win32 handle retrieval below.
+    const bool heliosKmtShared = heliosKmtOnlySharedResources();
+    bool useVulkanExternalMemory = m_shared && !heliosKmtShared;
+    bool useHeliosRendererExternalMemory = m_shared && heliosKmtShared;
+    VkExternalMemoryHandleTypeFlagBits heliosRendererHandleType =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
     // Set up external memory parameters for shared images
     VkExternalMemoryImageCreateInfo externalInfo = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
 
-    if (m_shared) {
+    if (useVulkanExternalMemory || useHeliosRendererExternalMemory) {
       externalInfo.pNext = std::exchange(imageInfo.pNext, &externalInfo);
-      externalInfo.handleTypes = m_info.sharing.type;
+      externalInfo.handleTypes = useHeliosRendererExternalMemory
+        ? heliosRendererHandleType
+        : m_info.sharing.type;
     }
 
     // Set up shared memory properties
@@ -318,23 +387,34 @@ namespace dxvk {
 
     VkExportMemoryAllocateInfo sharedExport = { VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
     VkImportMemoryWin32HandleInfoKHR sharedImportWin32 = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+    VkImportMemoryResourceInfoMESA heliosImportResource = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA_HELIOS };
 
-    if (m_shared && m_info.sharing.mode == DxvkSharedHandleMode::Export) {
+    if ((useVulkanExternalMemory || useHeliosRendererExternalMemory)
+     && m_info.sharing.mode == DxvkSharedHandleMode::Export) {
       sharedExport.pNext = std::exchange(sharedMemoryInfo, &sharedExport);
-      sharedExport.handleTypes = m_info.sharing.type;
+      sharedExport.handleTypes = useHeliosRendererExternalMemory
+        ? heliosRendererHandleType
+        : m_info.sharing.type;
     }
 
-    if (m_shared && m_info.sharing.mode == DxvkSharedHandleMode::Import) {
+    if (useVulkanExternalMemory && m_info.sharing.mode == DxvkSharedHandleMode::Import) {
       sharedImportWin32.pNext = std::exchange(sharedMemoryInfo, &sharedImportWin32);
       sharedImportWin32.handleType = m_info.sharing.type;
       sharedImportWin32.handle = m_info.sharing.handle;
+    }
+
+    if (useHeliosRendererExternalMemory && m_info.sharing.mode == DxvkSharedHandleMode::Import) {
+      heliosImportResource.pNext = std::exchange(sharedMemoryInfo, &heliosImportResource);
+      heliosImportResource.resourceId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_info.sharing.handle));
     }
 
     DxvkAllocationInfo allocationInfo = { };
     allocationInfo.resourceCookie = cookie();
     allocationInfo.properties = m_properties;
     allocationInfo.mode = mode;
-    allocationInfo.handleType = m_info.sharing.type;
+    allocationInfo.forceDedicated = m_shared && heliosKmtShared;
+    if (useVulkanExternalMemory && m_info.sharing.mode != DxvkSharedHandleMode::None)
+      allocationInfo.handleType = m_info.sharing.type;
 
     if (m_info.transient)
       allocationInfo.mode.set(DxvkAllocationMode::NoDedicated);
@@ -353,6 +433,15 @@ namespace dxvk {
   Rc<DxvkResourceAllocation> DxvkImage::assignStorageWithUsage(
           Rc<DxvkResourceAllocation>&& resource,
     const DxvkImageUsageInfo&         usageInfo) {
+    // Helios: never assign null storage — the getImageInfo() deref below AV'd
+    // DWM (fault at assignStorageWithUsage+0x284) when an import/allocation
+    // failure path handed a null resource through. Keep the current storage
+    // and hand back nothing for the caller to destroy.
+    if (resource == nullptr) {
+      Logger::err("DxvkImage::assignStorageWithUsage: null storage, ignoring assignment");
+      return nullptr;
+    }
+
     Rc<DxvkResourceAllocation> old = std::move(m_storage);
 
     // Self-assignment is possible here if we
@@ -405,7 +494,8 @@ namespace dxvk {
     if (invalidateViews)
       m_version += 1u;
 
-    if (!(m_properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+    if (!(m_properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+        !(m_shared && heliosKmtOnlySharedResources())) {
       auto common = m_properties & m_storage->getMemoryProperties();
 
       updateResidencyStatus((common & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
@@ -609,6 +699,16 @@ namespace dxvk {
       return false;
 
     if (!device->features().khrExternalMemoryWin32) {
+      if (heliosKmtOnlySharedResources()) {
+        if (createInfo.flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
+          Logger::err("Failed to create shared resource: Sharing sparse resources not supported");
+          return false;
+        }
+
+        Logger::warn("Helios KMT shared resource path: proceeding without VK_KHR_external_memory_win32");
+        return true;
+      }
+
       Logger::err("Failed to create shared resource: VK_KHR_EXTERNAL_MEMORY_WIN32 not supported");
       return false;
     }

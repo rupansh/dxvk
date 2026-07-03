@@ -123,7 +123,7 @@ namespace dxvk {
   
   std::string Logger::getFileName(const std::string& base) {
     std::string path = env::getEnvVar("DXVK_LOG_PATH");
-    
+
     if (path == "none")
       return std::string();
 
@@ -131,6 +131,13 @@ namespace dxvk {
     // Don't create a log file if we're writing to wine's console output
     if (path.empty() && m_wineLogOutput)
       return std::string();
+
+    // Helios: default the log next to the UMD's own per-pid log. Processes
+    // like dwm.exe cannot write their CWD (System32), which silently
+    // swallowed every Logger::err from the shared-surface create path;
+    // C:\ProgramData\Helios is writable by standard users.
+    if (path.empty())
+      path = "C:/ProgramData/Helios";
 #endif
 
     if (!path.empty() && *path.rbegin() != '/')

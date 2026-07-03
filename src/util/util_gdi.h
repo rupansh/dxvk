@@ -84,6 +84,26 @@ namespace dxvk {
       UINT SplitOffset;
   } D3DDDI_PATCHLOCATIONLIST;
 
+  typedef struct _D3DDDI_SYNCHRONIZATIONOBJECT_FLAGS
+  {
+      union
+      {
+          struct
+          {
+              UINT Shared : 1;
+              UINT NtSecuritySharing : 1;
+              UINT CrossAdapter : 1;
+              UINT TopOfPipeline : 1;
+              UINT NoSignal : 1;
+              UINT NoWait : 1;
+              UINT NoSignalMaxValueOnTdr : 1;
+              UINT NoGPUAccess : 1;
+              UINT Reserved : 24;
+          };
+          UINT Value;
+      };
+  } D3DDDI_SYNCHRONIZATIONOBJECT_FLAGS;
+
   typedef struct _D3DKMT_CREATEDEVICE
   {
       union
@@ -195,6 +215,22 @@ namespace dxvk {
       D3DKMT_HANDLE hKeyedMutex;
   } D3DKMT_OPENKEYEDMUTEX;
 
+  typedef struct _D3DKMT_OPENKEYEDMUTEX2
+  {
+      D3DKMT_HANDLE hSharedHandle;
+      D3DKMT_HANDLE hKeyedMutex;
+      void *pPrivateRuntimeData;
+      UINT PrivateRuntimeDataSize;
+  } D3DKMT_OPENKEYEDMUTEX2;
+
+  typedef struct _D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE
+  {
+      HANDLE hNtHandle;
+      D3DKMT_HANDLE hKeyedMutex;
+      void *pPrivateRuntimeData;
+      UINT PrivateRuntimeDataSize;
+  } D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE;
+
   typedef struct _D3DDDI_OPENALLOCATIONINFO
   {
       D3DKMT_HANDLE hAllocation;
@@ -262,6 +298,24 @@ namespace dxvk {
       D3DKMT_HANDLE hSyncObject;
   } D3DKMT_OPENSYNCOBJECTFROMNTHANDLE;
 
+  typedef struct _D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2
+  {
+      HANDLE hNtHandle;
+      D3DKMT_HANDLE hDevice;
+      D3DDDI_SYNCHRONIZATIONOBJECT_FLAGS Flags;
+      D3DKMT_HANDLE hSyncObject;
+      union
+      {
+          struct
+          {
+              void *FenceValueCPUVirtualAddress;
+              D3DGPU_VIRTUAL_ADDRESS FenceValueGPUVirtualAddress;
+              UINT EngineAffinity;
+          } MonitoredFence;
+          UINT64 Reserved[8];
+      };
+  } D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2;
+
   typedef struct _D3DKMT_QUERYRESOURCEINFO
   {
       D3DKMT_HANDLE hDevice;
@@ -290,6 +344,25 @@ namespace dxvk {
       UINT64 Key;
       UINT64 FenceValue;
   } D3DKMT_RELEASEKEYEDMUTEX;
+
+  typedef struct _D3DKMT_ACQUIREKEYEDMUTEX2
+  {
+      D3DKMT_HANDLE hKeyedMutex;
+      UINT64 Key;
+      LARGE_INTEGER *pTimeout;
+      UINT64 FenceValue;
+      void *pPrivateRuntimeData;
+      UINT PrivateRuntimeDataSize;
+  } D3DKMT_ACQUIREKEYEDMUTEX2;
+
+  typedef struct _D3DKMT_RELEASEKEYEDMUTEX2
+  {
+      D3DKMT_HANDLE hKeyedMutex;
+      UINT64 Key;
+      UINT64 FenceValue;
+      void *pPrivateRuntimeData;
+      UINT PrivateRuntimeDataSize;
+  } D3DKMT_RELEASEKEYEDMUTEX2;
 
   typedef struct _UNICODE_STRING {
       USHORT Length;        /* bytes */
@@ -430,6 +503,7 @@ namespace dxvk {
   };
 
   NTSTATUS WINAPI D3DKMTAcquireKeyedMutex(D3DKMT_ACQUIREKEYEDMUTEX *desc);
+  NTSTATUS WINAPI D3DKMTAcquireKeyedMutex2(D3DKMT_ACQUIREKEYEDMUTEX2 *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTCloseAdapter(const D3DKMT_CLOSEADAPTER *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTCreateDCFromMemory(D3DKMT_CREATEDCFROMMEMORY *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTCreateDevice(D3DKMT_CREATEDEVICE *desc);
@@ -442,12 +516,16 @@ namespace dxvk {
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTEscape(const D3DKMT_ESCAPE *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenAdapterFromLuid(D3DKMT_OPENADAPTERFROMLUID *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenKeyedMutex(D3DKMT_OPENKEYEDMUTEX *desc);
+  EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenKeyedMutex2(D3DKMT_OPENKEYEDMUTEX2 *desc);
+  EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenKeyedMutexFromNtHandle(D3DKMT_OPENKEYEDMUTEXFROMNTHANDLE *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenResource2(D3DKMT_OPENRESOURCE *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenResourceFromNtHandle(D3DKMT_OPENRESOURCEFROMNTHANDLE *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenSynchronizationObject(D3DKMT_OPENSYNCHRONIZATIONOBJECT *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenSyncObjectFromNtHandle(D3DKMT_OPENSYNCOBJECTFROMNTHANDLE *desc);
+  EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTOpenSyncObjectFromNtHandle2(D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTQueryResourceInfo(D3DKMT_QUERYRESOURCEINFO *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTQueryResourceInfoFromNtHandle(D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE *desc);
   NTSTATUS WINAPI D3DKMTReleaseKeyedMutex(D3DKMT_RELEASEKEYEDMUTEX *desc);
+  NTSTATUS WINAPI D3DKMTReleaseKeyedMutex2(D3DKMT_RELEASEKEYEDMUTEX2 *desc);
   EXTERN_C WINBASEAPI NTSTATUS WINAPI D3DKMTShareObjects(UINT count, const D3DKMT_HANDLE *handles, OBJECT_ATTRIBUTES *attr, UINT access, HANDLE *handle);
 }

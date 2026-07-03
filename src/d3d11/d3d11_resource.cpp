@@ -9,6 +9,13 @@
 
 namespace dxvk {
 
+  namespace {
+    bool heliosKmtOnlySharedResources() {
+      const char* value = std::getenv("HELIOS_DXVK_KMT_SHARED");
+      return value && value[0] == '1' && value[1] == '\0';
+    }
+  }
+
   D3D11DXGIKeyedMutex::D3D11DXGIKeyedMutex(
           ID3D11Resource* pResource,
           D3D11Device*    pDevice)
@@ -322,14 +329,34 @@ namespace dxvk {
     }
 
     D3DKMT_HANDLE local = texture->GetImage()->storage()->kmtLocal();
+    if (heliosKmtOnlySharedResources() && !local)
+      return DXGI_ERROR_INVALID_CALL;
+
     auto keyedMutex = texture->GetImage()->getKeyedMutex();
     if (keyedMutex) {
-      D3DKMT_HANDLE handles[] = {local, keyedMutex->kmtLocal(), keyedMutex->getSyncObject()->kmtLocal()};
-      if (!D3DKMTShareObjects(3, handles, &attr, dwAccess, pHandle))
+      D3DKMT_HANDLE handles[3] = { local, keyedMutex->kmtLocal(), 0 };
+      UINT count = handles[1] ? 2u : 1u;
+      auto sync = keyedMutex->getSyncObject();
+      if (sync && sync->kmtLocal())
+        handles[count++] = sync->kmtLocal();
+      else if (heliosKmtOnlySharedResources()) {
+        Logger::warn("D3D11DXGIResource::CreateSharedHandle: keyed mutex has no KMT sync object");
+        return DXGI_ERROR_INVALID_CALL;
+      }
+
+      NTSTATUS status = D3DKMTShareObjects(count, handles, &attr, dwAccess, pHandle);
+      if (!status)
         return S_OK;
-    } else if (!D3DKMTShareObjects(1, &local, &attr, dwAccess, pHandle)) {
-      return S_OK;
+      Logger::warn(str::format("D3D11DXGIResource::CreateSharedHandle: D3DKMTShareObjects failed: ", status));
+    } else {
+      NTSTATUS status = D3DKMTShareObjects(1, &local, &attr, dwAccess, pHandle);
+      if (!status)
+        return S_OK;
+      Logger::warn(str::format("D3D11DXGIResource::CreateSharedHandle: D3DKMTShareObjects(resource) failed: ", status));
     }
+
+    if (heliosKmtOnlySharedResources())
+      return DXGI_ERROR_INVALID_CALL;
 
     /* try legacy Proton shared resource implementation */
 

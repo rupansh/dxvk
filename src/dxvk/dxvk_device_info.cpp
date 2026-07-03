@@ -44,6 +44,7 @@ namespace dxvk {
     HANDLE_EXT(extTransformFeedback);              \
     HANDLE_EXT(extVertexAttributeDivisor);         \
     HANDLE_EXT(khrDynamicRenderingLocalRead);      \
+    HANDLE_EXT(khrExternalMemoryFd);               \
     HANDLE_EXT(khrExternalMemoryWin32);            \
     HANDLE_EXT(khrExternalSemaphoreWin32);         \
     HANDLE_EXT(khrLoadStoreOpNone);                \
@@ -570,6 +571,24 @@ namespace dxvk {
       m_featuresSupported.core.features.sparseResidencyAliased = VK_FALSE;
     }
 
+    /* Helios/DXVK currently routes D3D11 tiled resources through Vulkan
+     * sparse binds, but the Venus generated queue sparse-bind encoder is not
+     * robust enough for DWM's startup traffic in this WDDM path.  Desktop
+     * composition does not require D3D11 tiled resources, so keep them hidden
+     * until the sparse path is made conformant end-to-end.
+     */
+    m_featuresSupported.core.features.sparseBinding = VK_FALSE;
+    m_featuresSupported.core.features.sparseResidencyBuffer = VK_FALSE;
+    m_featuresSupported.core.features.sparseResidencyImage2D = VK_FALSE;
+    m_featuresSupported.core.features.sparseResidencyImage3D = VK_FALSE;
+    m_featuresSupported.core.features.sparseResidency2Samples = VK_FALSE;
+    m_featuresSupported.core.features.sparseResidency4Samples = VK_FALSE;
+    m_featuresSupported.core.features.sparseResidency8Samples = VK_FALSE;
+    m_featuresSupported.core.features.sparseResidency16Samples = VK_FALSE;
+    m_featuresSupported.core.features.sparseResidencyAliased = VK_FALSE;
+    m_featuresSupported.core.features.shaderResourceResidency = VK_FALSE;
+    m_featuresSupported.core.features.shaderResourceMinLod = VK_FALSE;
+
     // robustness2 is stronger than the Vulkan 1.3 feature
     if (m_featuresSupported.extRobustness2.robustImageAccess2)
       m_featuresSupported.vk13.robustImageAccess = VK_FALSE;
@@ -991,6 +1010,12 @@ namespace dxvk {
       /* External memory features for wine */
       ENABLE_EXT(khrExternalMemoryWin32, false),
       ENABLE_EXT(khrExternalSemaphoreWin32, false),
+
+      /* Helios venus ICD: fd-based external memory describes the renderer
+       * (host) side handle types; enabling it makes the ICD equip the host
+       * device with VK_KHR_external_memory_fd/VK_EXT_external_memory_dma_buf,
+       * which vkr's shared-surface export/import paths require. */
+      ENABLE_EXT(khrExternalMemoryFd, false),
 
       /* LOAD_OP_NONE for certain tiler optimizations. Core feature
        * in Vulkan 1.4, so probably supported by everything we need. */
