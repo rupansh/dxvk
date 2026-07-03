@@ -1168,9 +1168,17 @@ namespace dxvk {
     // E_INVALIDARG, never as silent wrong content.
     if (allocationInfo.importSizeOverride) {
       if (allocationInfo.importSizeOverride < requirements.memoryRequirements.size) {
-        Logger::warn(str::format("DxvkMemoryAllocator::createImageResource: import size override ",
+        // REFUSE, do not proceed: on NVIDIA an undersized dedicated import
+        // binds "successfully" and the GPU MMU-faults when it reads the
+        // missing tail (host Xid 31, FAULT_PTE VIRT_READ — killed the IDD
+        // capture feed live 2026-07-04). A failed open is recoverable by the
+        // caller; a dead GPU channel is not. The creator side (KMD standard
+        // allocations) now pads blobs past the host image requirement, so
+        // this tripping means that bound needs raising.
+        vk->vkDestroyImage(vk->device(), image, nullptr);
+        throw DxvkError(str::format("DxvkMemoryAllocator::createImageResource: import size override ",
           allocationInfo.importSizeOverride, " < image requirement ",
-          requirements.memoryRequirements.size));
+          requirements.memoryRequirements.size, " — refusing undersized import"));
       }
       requirements.memoryRequirements.size = allocationInfo.importSizeOverride;
     }
