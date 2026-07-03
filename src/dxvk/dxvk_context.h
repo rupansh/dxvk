@@ -1396,6 +1396,13 @@ namespace dxvk {
 
     std::vector<Rc<DxvkImage>> m_nonDefaultLayoutImages;
 
+    /* Helios external-memory coherence: shared images touched in the current
+     * command list (released to VK_QUEUE_FAMILY_EXTERNAL at submission end),
+     * and images released at the previous submission end (re-acquired at the
+     * next submission start). See releaseSharedImagesToExternal(). */
+    std::vector<Rc<DxvkImage>> m_sharedImagesTouched;
+    std::vector<Rc<DxvkImage>> m_sharedImagesReleased;
+
     DxvkDescriptorCopyWorker m_descriptorWorker;
 
     Rc<DxvkLatencyTracker>  m_latencyTracker;
@@ -1960,6 +1967,13 @@ namespace dxvk {
             bool                      renderPass);
 
     void prepareSharedImages();
+
+    void trackSharedImageTouched(
+            DxvkImage&                image);
+
+    void releaseSharedImagesToExternal();
+
+    void acquireSharedImagesFromExternal();
 
     bool transitionImageLayout(
             DxvkCmdBuffer             cmdBuffer,
