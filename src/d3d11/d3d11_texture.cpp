@@ -25,7 +25,8 @@ namespace dxvk {
           D3D11_RESOURCE_DIMENSION    Dimension,
           DXGI_USAGE                  DxgiUsage,
           VkImage                     vkImage,
-          HANDLE                      hSharedHandle)
+          HANDLE                      hSharedHandle,
+    const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport)
   : m_interface(pInterface), m_device(pDevice), m_dimension(Dimension), m_desc(*pDesc),
     m_11on12(p11on12Info ? *p11on12Info : D3D11_ON_12_RESOURCE_INFO()), m_dxgiUsage(DxgiUsage) {
     DXGI_VK_FORMAT_MODE   formatMode   = GetFormatMode();
@@ -74,6 +75,16 @@ namespace dxvk {
         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
         : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
       imageInfo.sharing.handle = hSharedHandle;
+
+      // Helios typed import: venus resid + creator allocation identity from
+      // the KMD open-identity record (no HANDLE punning). Forces Import mode
+      // regardless of the (unused) shared handle value.
+      if (pHeliosImport && pHeliosImport->ResourceId) {
+        imageInfo.sharing.mode = DxvkSharedHandleMode::Import;
+        imageInfo.sharing.heliosResourceId      = pHeliosImport->ResourceId;
+        imageInfo.sharing.heliosAllocSize       = pHeliosImport->AllocSize;
+        imageInfo.sharing.heliosMemoryTypeIndex = pHeliosImport->MemoryTypeIndex;
+      }
     }
 
     if (!pDevice->GetOptions()->disableMsaa)
@@ -1417,9 +1428,10 @@ namespace dxvk {
           D3D11Device*                pDevice,
     const D3D11_COMMON_TEXTURE_DESC*  pDesc,
     const D3D11_ON_12_RESOURCE_INFO*  p11on12Info,
-          HANDLE                      hSharedHandle)
+          HANDLE                      hSharedHandle,
+    const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport)
   : D3D11DeviceChild<ID3D11Texture2D1>(pDevice),
-    m_texture   (this, pDevice, pDesc, p11on12Info, D3D11_RESOURCE_DIMENSION_TEXTURE2D, 0, VK_NULL_HANDLE, hSharedHandle),
+    m_texture   (this, pDevice, pDesc, p11on12Info, D3D11_RESOURCE_DIMENSION_TEXTURE2D, 0, VK_NULL_HANDLE, hSharedHandle, pHeliosImport),
     m_interop   (this, &m_texture),
     m_surface   (this),
     m_resource  (this, pDevice),

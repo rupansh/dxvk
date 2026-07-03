@@ -1159,6 +1159,32 @@ namespace dxvk {
       dedicatedRequirements.prefersDedicatedAllocation = VK_TRUE;
     }
 
+    // Helios shared-resource import: allocate with the CREATOR's exact venus
+    // allocation size and memory type (from the KMD's open-identity record)
+    // instead of this image's own requirements — vkr's OPAQUE-fd import
+    // requires an exact-size match and the host only accepts the exported
+    // handle in the creator's memory type. Divergence is loud, not fatal: a
+    // smaller-than-required import fails at bind and surfaces as the caller's
+    // E_INVALIDARG, never as silent wrong content.
+    if (allocationInfo.importSizeOverride) {
+      if (allocationInfo.importSizeOverride < requirements.memoryRequirements.size) {
+        Logger::warn(str::format("DxvkMemoryAllocator::createImageResource: import size override ",
+          allocationInfo.importSizeOverride, " < image requirement ",
+          requirements.memoryRequirements.size));
+      }
+      requirements.memoryRequirements.size = allocationInfo.importSizeOverride;
+    }
+
+    if (allocationInfo.importMemoryTypeIndex != ~0u) {
+      uint32_t typeBit = 1u << allocationInfo.importMemoryTypeIndex;
+      if (!(requirements.memoryRequirements.memoryTypeBits & typeBit)) {
+        Logger::warn(str::format("DxvkMemoryAllocator::createImageResource: import memory type ",
+          allocationInfo.importMemoryTypeIndex, " not in image type mask ",
+          requirements.memoryRequirements.memoryTypeBits));
+      }
+      requirements.memoryRequirements.memoryTypeBits = typeBit;
+    }
+
     if (!dedicatedRequirements.requiresDedicatedAllocation && allocationInfo.mode.test(DxvkAllocationMode::NoDedicated))
       dedicatedRequirements.prefersDedicatedAllocation = VK_FALSE;
 
