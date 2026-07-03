@@ -9193,6 +9193,8 @@ namespace dxvk {
     } else {
       m_cmd->setDescriptorPool(m_descriptorPool);
     }
+
+    acquireSharedImagesFromExternal();
   }
 
 
@@ -9200,6 +9202,8 @@ namespace dxvk {
     endCurrentPass(true);
 
     prepareSharedImages();
+
+    releaseSharedImagesToExternal();
 
     m_sdmaAcquires.finalize(m_cmd);
     m_sdmaBarriers.finalize(m_cmd);
@@ -9361,12 +9365,30 @@ namespace dxvk {
 
   void DxvkContext::trackNonDefaultImageLayout(
             DxvkImage&                image) {
+    // Helios: layout transitions can change compression state, so they count
+    // as a touch for the external-release bookkeeping too (the main hooks
+    // live in accessImage/accessImageRegion, which see GENERAL-layout writes
+    // that never transition).
+    if (image.info().shared)
+      trackSharedImageTouched(image);
+
     for (const auto& e : m_nonDefaultLayoutImages) {
       if (e == &image)
         return;
     }
 
     m_nonDefaultLayoutImages.emplace_back(&image);
+  }
+
+
+  void DxvkContext::trackSharedImageTouched(
+            DxvkImage&                image) {
+    for (const auto& e : m_sharedImagesTouched) {
+      if (e == &image)
+        return;
+    }
+
+    m_sharedImagesTouched.emplace_back(&image);
   }
 
 
@@ -9517,12 +9539,29 @@ namespace dxvk {
 
 
   void DxvkContext::prepareSharedImages() {
-    // Only flush clears for shared images, and restore layouts
+    // Flush deferred clears targeting shared images by scanning the
+    // deferred-clear list itself. The previous scan over
+    // m_nonDefaultLayoutImages missed the clear-then-Flush pattern: an image
+    // whose ONLY pending work is a deferred clear never leaves its default
+    // layout, so it is absent from that list and its clear stayed deferred
+    // in this context indefinitely — while other devices/processes aliasing
+    // the shared memory read stale bytes forever. (Probe signature: clears
+    // diverge, copies propagate, and a readback through the clearing device
+    // — which forces the deferred clear — makes the same clears propagate.
+    // tools/d3d11_shared_content_probe.cpp / d3d11_shared_blob_truth_probe.)
     bool hasSharedClear = false;
 
-    for (const auto& image : m_nonDefaultLayoutImages) {
-      if (image->info().shared)
-        hasSharedClear = flushDeferredClear(*image, image->getAvailableSubresources());
+    for (size_t i = 0; i < m_deferredClears.size(); ) {
+      Rc<DxvkImage> image = m_deferredClears[i].imageView->image();
+
+      if (image->info().shared
+       && flushDeferredClear(*image, image->getAvailableSubresources())) {
+        // flushDeferredClear removed entries from the list; rescan
+        hasSharedClear = true;
+        i = 0;
+      } else {
+        i += 1;
+      }
     }
 
     if (hasSharedClear)
@@ -9531,6 +9570,82 @@ namespace dxvk {
     restoreImageLayouts([] (DxvkImage& image) {
       return image.info().shared;
     }, false);
+  }
+
+
+  void DxvkContext::releaseSharedImagesToExternal() {
+    // Helios external-memory coherence. Two D3D11 devices aliasing one shared
+    // surface are two Vulkan instances importing the same external memory on
+    // the host; the spec only makes one instance's writes available to the
+    // other after a queue-family release to VK_QUEUE_FAMILY_EXTERNAL (and the
+    // matching acquire on the consumer). Note: the 2026-07-03 clears-diverge
+    // investigation established these barriers are NOT what fixes stale
+    // shared content — that was the guest-side deferred-clear hole in
+    // prepareSharedImages — but they remain the spec's availability
+    // mechanism for external memory (native Windows gets this below the API
+    // from the WDDM driver; our host drivers only see the Vulkan contract),
+    // so emit them at every submission boundary for every shared image the
+    // command list touched. The matching self re-acquire happens at the
+    // start of the next command list (acquireSharedImagesFromExternal). All
+    // images DXVK creates use VK_SHARING_MODE_EXCLUSIVE, which QFOT requires.
+    for (const auto& image : m_sharedImagesTouched) {
+      VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      barrier.dstAccessMask = 0;
+      barrier.oldLayout = image->info().layout;
+      barrier.newLayout = image->info().layout;
+      barrier.srcQueueFamilyIndex = m_device->queues().graphics.queueFamily;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+      barrier.image = image->handle();
+      barrier.subresourceRange = image->getAvailableSubresources();
+
+      m_execBarriers.addImageBarrier(barrier);
+      m_cmd->track(image, DxvkAccess::Write);
+
+      Logger::debug(str::format("DxvkContext: released shared image to EXTERNAL: ",
+        std::hex, reinterpret_cast<uintptr_t>(image->handle())));
+
+      bool tracked = false;
+
+      for (const auto& e : m_sharedImagesReleased)
+        tracked |= (e == image);
+
+      if (!tracked)
+        m_sharedImagesReleased.push_back(image);
+    }
+
+    m_sharedImagesTouched.clear();
+  }
+
+
+  void DxvkContext::acquireSharedImagesFromExternal() {
+    // Re-acquire ownership of the shared images this context released to
+    // VK_QUEUE_FAMILY_EXTERNAL at the previous submission boundary, so the
+    // next submission's accesses are again well-defined (and pick up any
+    // writes another instance released in the meantime).
+    for (const auto& image : m_sharedImagesReleased) {
+      VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      barrier.srcAccessMask = 0;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+      barrier.oldLayout = image->info().layout;
+      barrier.newLayout = image->info().layout;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+      barrier.dstQueueFamilyIndex = m_device->queues().graphics.queueFamily;
+      barrier.image = image->handle();
+      barrier.subresourceRange = image->getAvailableSubresources();
+
+      m_execBarriers.addImageBarrier(barrier);
+      m_cmd->track(image, DxvkAccess::Write);
+
+      Logger::debug(str::format("DxvkContext: acquired shared image from EXTERNAL: ",
+        std::hex, reinterpret_cast<uintptr_t>(image->handle())));
+    }
+
+    m_sharedImagesReleased.clear();
   }
 
 
@@ -9851,6 +9966,16 @@ namespace dxvk {
 
     batch.addImageBarrier(barrier);
 
+    // Helios: every write access to a shared image must be followed by an
+    // external queue-family release at submission end. This is the central
+    // access-declaration path, so it sees clears, render-pass writes, copies
+    // and UAV writes regardless of whether the image ever leaves its default
+    // (GENERAL) layout — layout-transition tracking alone misses producers
+    // that render entirely in GENERAL.
+    if (unlikely(image.info().shared)
+     && ((srcAccess & vk::AccessWriteMask) || srcLayout != dstLayout))
+      trackSharedImageTouched(image);
+
     if (cmdBuffer == DxvkCmdBuffer::ExecBuffer) {
       bool hasWrite = (srcAccess & vk::AccessWriteMask) || (srcLayout != dstLayout);
       bool hasRead = (srcAccess & vk::AccessReadMask);
@@ -9935,6 +10060,11 @@ namespace dxvk {
     barrier.dstAccessMask = dstAccess;
 
     batch.addMemoryBarrier(barrier);
+
+    // Helios: see the matching hook in accessImage — region writes to shared
+    // images (e.g. UpdateSubresource copies) also need the external release.
+    if (unlikely(image.info().shared) && (srcAccess & vk::AccessWriteMask))
+      trackSharedImageTouched(image);
 
     if (cmdBuffer == DxvkCmdBuffer::ExecBuffer) {
       bool hasWrite = (srcAccess & vk::AccessWriteMask) || (srcLayout != dstLayout);
