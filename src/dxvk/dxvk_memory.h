@@ -52,6 +52,16 @@ namespace dxvk {
       // we could add a `int fd` here, etc.
       HANDLE handle = INVALID_HANDLE_VALUE;
     };
+    /// Helios KMT-mode typed import identity. When \c heliosResourceId is
+    /// nonzero on an Import-mode sharing info, the image imports the backing
+    /// venus memory by this resource id (no HANDLE punning), allocating with
+    /// the creator's exact allocation size and memory type as recorded by the
+    /// KMD's open-identity ABI — vkr's OPAQUE-fd import requires an exact-size
+    /// match, and the memory type must be one the host accepts for the
+    /// exported handle; the opener's own image requirements are neither.
+    uint32_t     heliosResourceId       = 0u;
+    VkDeviceSize heliosAllocSize        = 0u;
+    uint32_t     heliosMemoryTypeIndex  = ~0u;
   };
 
 
@@ -1034,6 +1044,14 @@ namespace dxvk {
     VkExternalMemoryHandleTypeFlagBits handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_FLAG_BITS_MAX_ENUM;
     /// Force a dedicated VkDeviceMemory allocation even without Vulkan external-memory pNexts.
     bool forceDedicated = false;
+    /// Helios import identity: when nonzero, the dedicated allocation uses
+    /// EXACTLY this allocationSize instead of the image's own memory
+    /// requirements (the creator's recorded venus allocation size — required
+    /// for vkr's exact-size OPAQUE-fd import of a shared resource).
+    VkDeviceSize importSizeOverride = 0u;
+    /// Helios import identity: when != ~0u, restricts the allocation to this
+    /// memory type (the creator's recorded memoryTypeIndex).
+    uint32_t importMemoryTypeIndex = ~0u;
   };
 
 

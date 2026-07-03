@@ -405,7 +405,16 @@ namespace dxvk {
 
     if (useHeliosRendererExternalMemory && m_info.sharing.mode == DxvkSharedHandleMode::Import) {
       heliosImportResource.pNext = std::exchange(sharedMemoryInfo, &heliosImportResource);
-      heliosImportResource.resourceId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_info.sharing.handle));
+      if (m_info.sharing.heliosResourceId) {
+        // Typed import path: the venus resid + creator's allocation identity
+        // arrive explicitly (KMD open-identity ABI via the UMD bridge).
+        heliosImportResource.resourceId = m_info.sharing.heliosResourceId;
+      } else {
+        // Legacy HANDLE-punned resid. Should be unreachable now that the UMD
+        // passes the typed identity; loud so any surviving caller is found.
+        Logger::warn("DxvkImage: KMT import without typed venus identity (legacy HANDLE-punned resid)");
+        heliosImportResource.resourceId = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_info.sharing.handle));
+      }
     }
 
     DxvkAllocationInfo allocationInfo = { };
@@ -413,6 +422,13 @@ namespace dxvk {
     allocationInfo.properties = m_properties;
     allocationInfo.mode = mode;
     allocationInfo.forceDedicated = m_shared && heliosKmtShared;
+
+    if (useHeliosRendererExternalMemory && m_info.sharing.mode == DxvkSharedHandleMode::Import) {
+      // Import with the creator's exact venus allocation size and memory type
+      // (see DxvkSharedHandleInfo::heliosAllocSize).
+      allocationInfo.importSizeOverride = m_info.sharing.heliosAllocSize;
+      allocationInfo.importMemoryTypeIndex = m_info.sharing.heliosMemoryTypeIndex;
+    }
     if (useVulkanExternalMemory && m_info.sharing.mode != DxvkSharedHandleMode::None)
       allocationInfo.handleType = m_info.sharing.type;
 

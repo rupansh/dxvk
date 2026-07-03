@@ -75,6 +75,21 @@ namespace dxvk {
   
   
   /**
+   * \brief Helios typed shared-surface import identity
+   *
+   * The venus resource id plus the creator's exact allocation size and
+   * memory type, as recorded by the Helios KMD's open-identity ABI and
+   * delivered through the UMD bridge. Replaces the legacy scheme of punning
+   * the resid into the shared HANDLE parameter.
+   */
+  struct D3D11_HELIOS_IMPORT_INFO {
+    uint32_t ResourceId       = 0u;
+    uint64_t AllocSize        = 0u;
+    uint32_t MemoryTypeIndex  = ~0u;
+  };
+
+
+  /**
    * \brief D3D11 common texture object
    * 
    * This class implements common texture methods and
@@ -95,7 +110,8 @@ namespace dxvk {
             D3D11_RESOURCE_DIMENSION    Dimension,
             DXGI_USAGE                  DxgiUsage,
             VkImage                     vkImage,
-            HANDLE                      hSharedHandle);
+            HANDLE                      hSharedHandle,
+      const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport = nullptr);
     
     ~D3D11CommonTexture();
     
@@ -807,7 +823,8 @@ namespace dxvk {
             D3D11Device*                pDevice,
       const D3D11_COMMON_TEXTURE_DESC*  pDesc,
       const D3D11_ON_12_RESOURCE_INFO*  p11on12Info,
-            HANDLE                      hSharedHandle);
+            HANDLE                      hSharedHandle,
+      const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport = nullptr);
 
     D3D11Texture2D(
             D3D11Device*                pDevice,
