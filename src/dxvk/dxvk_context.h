@@ -1398,6 +1398,14 @@ namespace dxvk {
     std::vector<Rc<DxvkImage>> m_sharedImagesTouched;
     std::vector<Rc<DxvkImage>> m_sharedImagesReleased;
 
+    /* Helios GDI staging (approach A): staged shared images sampled in the
+     * current command list, and the set to refresh (buffer->image copy) at the
+     * next command-list start so the sampler sees fresh executor bytes. Reads
+     * enroll into "touched"; end-of-list moves it to "refresh"; the next
+     * acquireSharedImagesFromExternal() copies then clears it. */
+    std::vector<Rc<DxvkImage>> m_heliosStagedTouched;
+    std::vector<Rc<DxvkImage>> m_heliosStagedRefresh;
+
     DxvkDescriptorCopyWorker m_descriptorWorker;
 
     Rc<DxvkLatencyTracker>  m_latencyTracker;
@@ -1955,6 +1963,11 @@ namespace dxvk {
 
     void trackSharedImageTouched(
             DxvkImage&                image);
+
+    void trackHeliosStagedImage(
+            DxvkImage&                image);
+
+    void refreshHeliosStagedImages();
 
     void releaseSharedImagesToExternal();
 

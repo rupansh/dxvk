@@ -9368,8 +9368,10 @@ namespace dxvk {
     // Helios: layout transitions can change compression state, so they count
     // as a touch for the external-release bookkeeping too (the main hooks
     // live in accessImage/accessImageRegion, which see GENERAL-layout writes
-    // that never transition).
-    if (image.info().shared)
+    // that never transition). GDI-staged images are private device-local
+    // surfaces (their external partner is the staging buffer, not the image),
+    // so they must NOT be released to VK_QUEUE_FAMILY_EXTERNAL.
+    if (image.info().shared && !image.isHeliosGdiStaged())
       trackSharedImageTouched(image);
 
     for (const auto& e : m_nonDefaultLayoutImages) {
@@ -9389,6 +9391,54 @@ namespace dxvk {
     }
 
     m_sharedImagesTouched.emplace_back(&image);
+  }
+
+
+  void DxvkContext::trackHeliosStagedImage(
+            DxvkImage&                image) {
+    for (const auto& e : m_heliosStagedTouched) {
+      if (e == &image)
+        return;
+    }
+
+    m_heliosStagedTouched.emplace_back(&image);
+  }
+
+
+  void DxvkContext::refreshHeliosStagedImages() {
+    // Helios GDI staging (approach A): before this command list samples the
+    // staged shared surfaces it consumed in the previous list, copy the
+    // creator's latest host-visible bytes into each private device-local
+    // sampled image. The kernel GDI executor writes 4 bytes/texel at a
+    // round_up(width*4,256) byte stride, so a row alignment of the
+    // cross-adapter pitch alignment (256) reproduces that exact source pitch
+    // inside copyImageBufferData (rowPitch := align(width*4,256),
+    // bufferRowLength := rowPitch/4). The copy reconciles pitch (row length),
+    // tiling (OPTIMAL target) and memory domain (device-local target) at once.
+    //
+    // Coherence caveat: the executor writes the BAR concurrently, so a torn
+    // read here is a possible minor transient — acceptable for now.
+    constexpr VkDeviceSize HeliosCrossAdapterPitchAlign = 256u;
+
+    for (const auto& image : m_heliosStagedRefresh) {
+      const auto& staging = image->heliosStagingBuffer();
+
+      if (!image->isHeliosGdiStaged() || staging == nullptr)
+        continue;
+
+      VkImageSubresourceLayers subresource = { };
+      subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+      subresource.mipLevel       = 0u;
+      subresource.baseArrayLayer = 0u;
+      subresource.layerCount     = 1u;
+
+      copyBufferToImage(image, subresource,
+        VkOffset3D { 0, 0, 0 }, image->mipLevelExtent(0u),
+        staging, 0u, HeliosCrossAdapterPitchAlign, 0u,
+        image->info().format);
+    }
+
+    m_heliosStagedRefresh.clear();
   }
 
 
@@ -9617,6 +9667,15 @@ namespace dxvk {
     }
 
     m_sharedImagesTouched.clear();
+
+    // Helios GDI staging: carry the staged images sampled this list forward so
+    // the next list refreshes them (buffer->image copy) before sampling again.
+    // m_heliosStagedRefresh was cleared at this list's start by
+    // refreshHeliosStagedImages(), and m_heliosStagedTouched is already deduped.
+    for (auto& image : m_heliosStagedTouched)
+      m_heliosStagedRefresh.push_back(std::move(image));
+
+    m_heliosStagedTouched.clear();
   }
 
 
@@ -9646,6 +9705,10 @@ namespace dxvk {
     }
 
     m_sharedImagesReleased.clear();
+
+    // Helios GDI staging: copy fresh executor bytes into the staged surfaces
+    // sampled by the previous command list, before this list samples them.
+    refreshHeliosStagedImages();
   }
 
 
@@ -9972,9 +10035,16 @@ namespace dxvk {
     // and UAV writes regardless of whether the image ever leaves its default
     // (GENERAL) layout — layout-transition tracking alone misses producers
     // that render entirely in GENERAL.
-    if (unlikely(image.info().shared)
+    if (unlikely(image.info().shared) && !image.isHeliosGdiStaged()
      && ((srcAccess & vk::AccessWriteMask) || srcLayout != dstLayout))
       trackSharedImageTouched(image);
+
+    // Helios GDI staging: a sampler read of a staged image arms it for a
+    // buffer->image refresh at the next command-list start (see
+    // refreshHeliosStagedImages). Our own copy is a write, so it does not
+    // re-arm — refresh stops once nothing samples the surface.
+    if (unlikely(image.isHeliosGdiStaged()) && (srcAccess & vk::AccessReadMask))
+      trackHeliosStagedImage(image);
 
     if (cmdBuffer == DxvkCmdBuffer::ExecBuffer) {
       bool hasWrite = (srcAccess & vk::AccessWriteMask) || (srcLayout != dstLayout);
@@ -10062,9 +10132,13 @@ namespace dxvk {
     batch.addMemoryBarrier(barrier);
 
     // Helios: see the matching hook in accessImage — region writes to shared
-    // images (e.g. UpdateSubresource copies) also need the external release.
-    if (unlikely(image.info().shared) && (srcAccess & vk::AccessWriteMask))
+    // images (e.g. UpdateSubresource copies) also need the external release,
+    // except GDI-staged images (private device-local; never QFOT'd to EXTERNAL).
+    if (unlikely(image.info().shared) && !image.isHeliosGdiStaged() && (srcAccess & vk::AccessWriteMask))
       trackSharedImageTouched(image);
+
+    if (unlikely(image.isHeliosGdiStaged()) && (srcAccess & vk::AccessReadMask))
+      trackHeliosStagedImage(image);
 
     if (cmdBuffer == DxvkCmdBuffer::ExecBuffer) {
       bool hasWrite = (srcAccess & vk::AccessWriteMask) || (srcLayout != dstLayout);

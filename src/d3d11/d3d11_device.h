@@ -434,6 +434,11 @@ namespace dxvk {
       return m_initializer->InitShaderIcb(pShader, IcbSize, pIcbData);
     }
 
+    void InitializeStagedTexture(
+            D3D11CommonTexture*         pTexture) {
+      m_initializer->InitHeliosStagedTexture(pTexture);
+    }
+
     VkPipelineStageFlags GetEnabledShaderStages() const {
       return m_dxvkDevice->getShaderPipelineStages();
     }

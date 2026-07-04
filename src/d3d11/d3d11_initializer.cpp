@@ -55,6 +55,45 @@ namespace dxvk {
   }
 
 
+  void D3D11Initializer::InitHeliosStagedTexture(
+          D3D11CommonTexture*         pTexture) {
+    Rc<DxvkImage> image = pTexture->GetImage();
+
+    if (image == nullptr || !image->isHeliosGdiStaged())
+      return;
+
+    Rc<DxvkBuffer> staging = image->heliosStagingBuffer();
+
+    if (staging == nullptr)
+      return;
+
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    m_transferCommands += 1;
+
+    // The kernel GDI executor writes 4 bytes/texel at a round_up(width*4,256)
+    // byte stride; a row alignment of the cross-adapter pitch alignment (256)
+    // reproduces that exact source pitch in copyImageBufferData. This transition
+    // (UNDEFINED->GENERAL) + fill runs on the initializer's CS chunk, which is
+    // ordered before the texture's first use on the immediate context.
+    EmitCs([
+      cImage   = std::move(image),
+      cStaging = std::move(staging)
+    ] (DxvkContext* ctx) {
+      VkImageSubresourceLayers subresource = { };
+      subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+      subresource.mipLevel       = 0u;
+      subresource.baseArrayLayer = 0u;
+      subresource.layerCount     = 1u;
+
+      ctx->copyBufferToImage(cImage, subresource,
+        VkOffset3D { 0, 0, 0 }, cImage->mipLevelExtent(0u),
+        cStaging, 0u, 256u, 0u, cImage->info().format);
+    });
+
+    ThrottleAllocationLocked();
+  }
+
+
   void D3D11Initializer::InitUavCounter(
           D3D11UnorderedAccessView*   pUav) {
     auto counterView = pUav->GetCounterView();

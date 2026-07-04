@@ -9,6 +9,8 @@
 
 namespace dxvk {
 
+  class DxvkBuffer;
+
   /**
    * \brief Image create info
    * 
@@ -556,8 +558,23 @@ namespace dxvk {
           return VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
       }
 
-      return likely(m_info.tiling == VK_IMAGE_TILING_OPTIMAL)
-        ? layout : VK_IMAGE_LAYOUT_GENERAL;
+      // Helios: images whose canonical layout is GENERAL are pinned there and
+      // never transitioned to an optimal layout — shared/external textures kept
+      // in GENERAL for cross-process/venus coherence (see d3d11_texture.cpp
+      // `imageInfo.layout = GENERAL` for shared images + prepareSharedImages),
+      // and storage images. Upstream 94bbe9ae ("always respect image layout")
+      // dropped the `m_info.layout == GENERAL` coercion and returns the
+      // requested optimal layout for any OPTIMAL-tiled image, on the assumption
+      // it will be transitioned to match. That assumption does NOT hold for our
+      // pinned-GENERAL shared images: a composition sampler declaring
+      // SHADER_READ_ONLY_OPTIMAL then mismatches the image's GENERAL contents
+      // (VUID-vkCmdDraw-imageLayout-00344, live on dwm's `t0` desktop sampler →
+      // garbage/black composition on NVIDIA). Restore the coercion alongside the
+      // linear-tiling one: only GENERAL-canonical / linear images are forced to
+      // GENERAL; normal OPTIMAL images still respect the requested layout.
+      return (m_info.layout == VK_IMAGE_LAYOUT_GENERAL
+              || m_info.tiling != VK_IMAGE_TILING_OPTIMAL)
+        ? VK_IMAGE_LAYOUT_GENERAL : layout;
     }
 
     /**
@@ -844,6 +861,27 @@ namespace dxvk {
       return m_debugName.c_str();
     }
 
+    /**
+     * \brief Whether this is a Helios GDI-staged shared image
+     *
+     * When true, the image is a private device-local sampled surface refreshed
+     * each frame from \ref heliosStagingBuffer via a pitch-correct
+     * \c vkCmdCopyBufferToImage, rather than binding the creator's host-visible
+     * memory directly (which cannot reconcile the executor's fixed row pitch
+     * with a driver-chosen linear-image pitch).
+     */
+    bool isHeliosGdiStaged() const {
+      return m_heliosGdiStaged;
+    }
+
+    /**
+     * \brief Backing venus host-visible staging buffer, if GDI-staged
+     * \returns The staging buffer, or null
+     */
+    const Rc<DxvkBuffer>& heliosStagingBuffer() const {
+      return m_heliosStagingBuffer;
+    }
+
   private:
 
     Rc<vk::DeviceFn>            m_vkd;
@@ -855,6 +893,12 @@ namespace dxvk {
     uint32_t                    m_version     = 0u;
     bool                        m_shared      = false;
     bool                        m_stableAddress = false;
+
+    // Helios GDI staging (approach A): when set, this image is a private
+    // device-local sampled surface and m_heliosStagingBuffer holds the
+    // creator's host-visible venus bytes to be copied in per frame.
+    bool                        m_heliosGdiStaged = false;
+    Rc<DxvkBuffer>              m_heliosStagingBuffer = nullptr;
 
     bool                        m_unifiedLayoutEnabled = false;
     bool                        m_unifiedLayoutAvailable = false;

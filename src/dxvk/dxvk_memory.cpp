@@ -1186,6 +1186,51 @@ namespace dxvk {
     if (allocationInfo.importMemoryTypeIndex != ~0u) {
       uint32_t typeBit = 1u << allocationInfo.importMemoryTypeIndex;
       if (!(requirements.memoryRequirements.memoryTypeBits & typeBit)) {
+        // Helios GDI standard allocations: the KMD backs these with HOST_VISIBLE
+        // memory so the kernel GDI executor can CPU-write the surface through the
+        // BAR (linearly). An OPTIMAL device-local image reports only device-local
+        // memory types, so the host-visible import type is absent from the mask
+        // (VUID-VkBindImageMemoryInfo-pNext-01615) and NVIDIA cannot read the
+        // executor's host-visible LINEAR writes through a device-local optimal
+        // image — the surface samples BLACK (the black desktop). Recreate the
+        // image with LINEAR tiling: a linear image's requirements DO include
+        // host-visible types, so the import binds legally AND the sampler reads
+        // the executor's linearly-written pixels. Only single-sample/mip/layer
+        // images are eligible for linear tiling.
+        if (createInfo.tiling == VK_IMAGE_TILING_OPTIMAL
+         && createInfo.mipLevels == 1u
+         && createInfo.arrayLayers == 1u
+         && createInfo.samples == VK_SAMPLE_COUNT_1_BIT) {
+          VkImageCreateInfo linearInfo = createInfo;
+          linearInfo.tiling = VK_IMAGE_TILING_LINEAR;
+
+          VkImage linearImage = VK_NULL_HANDLE;
+          if (vk->vkCreateImage(vk->device(), &linearInfo, nullptr, &linearImage) == VK_SUCCESS) {
+            VkImageMemoryRequirementsInfo2 linReqInfo = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2 };
+            linReqInfo.image = linearImage;
+            VkMemoryRequirements2 linReqs = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+            vk->vkGetImageMemoryRequirements2(vk->device(), &linReqInfo, &linReqs);
+
+            if (linReqs.memoryRequirements.memoryTypeBits & typeBit) {
+              // Linear layout accepts the host-visible import type — swap to it.
+              vk->vkDestroyImage(vk->device(), image, nullptr);
+              image = linearImage;
+              requirements.memoryRequirements = linReqs.memoryRequirements;
+              // The import size was validated against the OPTIMAL requirement
+              // above; honor the creator's recorded (linear) size if it is at
+              // least the linear requirement.
+              if (allocationInfo.importSizeOverride >= requirements.memoryRequirements.size)
+                requirements.memoryRequirements.size = allocationInfo.importSizeOverride;
+              Logger::info("DxvkMemoryAllocator::createImageResource: recreated host-visible "
+                "import as LINEAR to match the GDI executor's writes");
+            } else {
+              vk->vkDestroyImage(vk->device(), linearImage, nullptr);
+            }
+          }
+        }
+      }
+      // Re-check after the possible linear swap; warn only if still incompatible.
+      if (!(requirements.memoryRequirements.memoryTypeBits & typeBit)) {
         Logger::warn(str::format("DxvkMemoryAllocator::createImageResource: import memory type ",
           allocationInfo.importMemoryTypeIndex, " not in image type mask ",
           requirements.memoryRequirements.memoryTypeBits));
@@ -1376,6 +1421,147 @@ namespace dxvk {
     allocation->m_flags.set(DxvkAllocationFlag::Imported);
     allocation->m_resourceCookie = allocation->m_resourceCookie;
     allocation->m_image = imageHandle;
+
+    return allocation;
+  }
+
+
+  bool DxvkMemoryAllocator::isHostVisibleMemoryType(uint32_t index) const {
+    if (index >= m_memTypes.size())
+      return false;
+
+    return (m_memTypes[index].properties.propertyFlags
+      & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u;
+  }
+
+
+  Rc<DxvkResourceAllocation> DxvkMemoryAllocator::importVenusStagingBuffer(
+          VkDeviceSize                allocSize,
+          uint32_t                    memoryTypeIndex,
+          uint32_t                    resourceId) {
+    // Helios-local venus resource-import struct (mirrors dxvk_image.cpp; kept
+    // TU-local like the image-import path so no shared header is needed).
+    struct VkImportMemoryResourceInfoMESA {
+      VkStructureType sType;
+      const void* pNext;
+      uint32_t resourceId;
+    };
+    constexpr VkStructureType VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA_HELIOS =
+      VkStructureType(1000384002);
+
+    auto vk = m_device->vkd();
+
+    if (memoryTypeIndex >= m_memTypes.size()) {
+      Logger::warn(str::format("DxvkMemoryAllocator::importVenusStagingBuffer: "
+        "invalid memory type index ", memoryTypeIndex));
+      return nullptr;
+    }
+
+    // Create a plain linear buffer flagged as externally-memory-backed. Venus
+    // uses the renderer-side OPAQUE_FD handle type for the pNext chain.
+    VkExternalMemoryBufferCreateInfo externalInfo = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+    externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &externalInfo };
+    bufferInfo.size        = allocSize;
+    bufferInfo.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkResult vr = vk->vkCreateBuffer(vk->device(), &bufferInfo, nullptr, &buffer);
+
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("DxvkMemoryAllocator::importVenusStagingBuffer: "
+        "vkCreateBuffer failed: ", vr));
+      return nullptr;
+    }
+
+    VkBufferMemoryRequirementsInfo2 reqInfo = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
+    reqInfo.buffer = buffer;
+
+    VkMemoryRequirements2 requirements = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+    vk->vkGetBufferMemoryRequirements2(vk->device(), &reqInfo, &requirements);
+
+    uint32_t typeBit = 1u << memoryTypeIndex;
+
+    if (!(requirements.memoryRequirements.memoryTypeBits & typeBit)) {
+      // A plain linear buffer should accept the host-visible import type (this
+      // is the whole point of importing as a buffer rather than an image), so
+      // if it does not, something changed in the device's memory model — bail
+      // loudly and let the caller fall back to the image-import path.
+      Logger::warn(str::format("DxvkMemoryAllocator::importVenusStagingBuffer: "
+        "import memory type ", memoryTypeIndex, " not in buffer type mask ",
+        requirements.memoryRequirements.memoryTypeBits));
+      vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
+      return nullptr;
+    }
+
+    // vkr's OPAQUE-fd import requires an EXACT-size match against the creator's
+    // recorded allocation size (the host allocates VkDeviceMemory of the blob's
+    // size), so the allocation size must be exactly allocSize — not the buffer's
+    // own (possibly larger) memory requirement. The creator pads blobs past the
+    // resource requirement, so allocSize should already cover this linear
+    // buffer; if somehow it does not, binding would be illegal — bail and let
+    // the caller fall back. Mirrors createImageResource's importSizeOverride.
+    if (allocSize < requirements.memoryRequirements.size) {
+      Logger::warn(str::format("DxvkMemoryAllocator::importVenusStagingBuffer: "
+        "creator alloc size ", allocSize, " < buffer requirement ",
+        requirements.memoryRequirements.size, " — refusing undersized import"));
+      vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
+      return nullptr;
+    }
+
+    VkDeviceSize size = allocSize;
+    requirements.memoryRequirements.size = size;
+    requirements.memoryRequirements.memoryTypeBits = typeBit;
+
+    VkImportMemoryResourceInfoMESA importResource = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA_HELIOS };
+    importResource.resourceId = resourceId;
+
+    VkMemoryDedicatedAllocateInfo dedicatedInfo = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &importResource };
+    dedicatedInfo.buffer = buffer;
+
+    DxvkAllocationInfo allocationInfo = { };
+    // Deliberately request NO memory properties. Two reasons:
+    //  1. We must NOT map this memory on the guest. allocateDedicatedMemory
+    //     calls mapDeviceMemory whenever properties has HOST_VISIBLE, and
+    //     vkMapMemory on an IMPORTED venus resource fails with
+    //     VK_ERROR_MEMORY_MAP_FAILED (the imported blob's guest mapping isn't
+    //     set up like a natively-allocated host-visible blob) — that throw is
+    //     what crash-looped dwm. The staging buffer is only ever read
+    //     device-side by vkCmdCopyBufferToImage, so it needs no CPU mapping.
+    //  2. properties==0 makes getMemoryTypeMask(0) return every system-memory
+    //     type, so intersecting with the requirement mask (now just typeBit)
+    //     still selects exactly the host-visible import type. This mirrors how
+    //     the image-import path reaches the host-visible type via its
+    //     device-local-stripped fallback (which also never maps).
+    allocationInfo.properties = 0u;
+
+    Rc<DxvkResourceAllocation> allocation = allocateDedicatedMemory(
+      requirements.memoryRequirements, allocationInfo, &dedicatedInfo);
+
+    if (!allocation) {
+      Logger::warn("DxvkMemoryAllocator::importVenusStagingBuffer: "
+        "failed to import dedicated memory");
+      vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
+      return nullptr;
+    }
+
+    // Adopt the buffer into the allocation so its destructor frees it.
+    allocation->m_flags.set(DxvkAllocationFlag::OwnsBuffer);
+    allocation->m_buffer = buffer;
+    allocation->m_bufferOffset = 0u;
+    allocation->m_size = size;
+
+    vr = vk->vkBindBufferMemory(vk->device(), buffer, allocation->m_memory,
+      allocation->m_address & DxvkPageAllocator::ChunkAddressMask);
+
+    if (vr != VK_SUCCESS) {
+      Logger::warn(str::format("DxvkMemoryAllocator::importVenusStagingBuffer: "
+        "vkBindBufferMemory failed: ", vr));
+      // Allocation now owns buffer + memory; dropping the Rc frees both.
+      return nullptr;
+    }
 
     return allocation;
   }

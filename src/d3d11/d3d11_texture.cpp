@@ -279,9 +279,20 @@ namespace dxvk {
 
       ExportImageInfo();
     }
+
+    // Helios GDI staging: opened shared textures skip the normal InitTexture
+    // path (their content usually lives in imported memory). A staged texture
+    // is instead a private device-local surface that must be transitioned to
+    // GENERAL and filled from its staging buffer BEFORE dwm can sample it —
+    // otherwise the host image is sampled while still UNDEFINED
+    // (VUID-vkCmdDraw-None-09600) and NVIDIA loses the device. The init copy is
+    // recorded on the initializer's CS chunk, ordered before the texture's
+    // first use on the immediate context.
+    if (m_image != nullptr && m_image->isHeliosGdiStaged())
+      m_device->InitializeStagedTexture(this);
   }
-  
-  
+
+
   D3D11CommonTexture::~D3D11CommonTexture() {
     
   }
