@@ -1,5 +1,6 @@
 #include "dxvk_image.h"
 
+#include "dxvk_buffer.h"
 #include "dxvk_device.h"
 
 #include <cstdlib>
@@ -193,6 +194,18 @@ namespace dxvk {
 
     assignStorage(allocateStorage());
 
+    // Helios GDI staging: a normal Import image is tracked as already-GENERAL
+    // because its bound external memory carries the creator's GENERAL-layout
+    // content. A staged image is instead a PRIVATE device-local surface created
+    // in initialLayout (UNDEFINED) with no content — so it must be tracked as
+    // UNDEFINED, not GENERAL, or DXVK assumes it is already GENERAL and never
+    // emits the UNDEFINED->GENERAL transition. The host VkImage then stays
+    // UNDEFINED at the composition draw (VUID-vkCmdDraw-None-09600) and NVIDIA
+    // loses the device. Tracking the real layout makes every transition (the
+    // init/refresh copy AND dwm's sample) correct.
+    if (m_heliosGdiStaged)
+      m_globalLayout = m_info.initialLayout;
+
     // Helios: createImageResource returns null (rather than throwing) when the
     // backing memory allocation fails — e.g. the venus/host side refusing the
     // export-memory blob. A storage-less image is a time bomb (AVs at
@@ -371,6 +384,72 @@ namespace dxvk {
     bool useHeliosRendererExternalMemory = m_shared && heliosKmtShared;
     VkExternalMemoryHandleTypeFlagBits heliosRendererHandleType =
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    // Helios GDI staging (approach A): the KMD backs standard allocations (the
+    // GDI redirection/shadow surfaces the kernel executor CPU-writes through
+    // the BAR) with HOST_VISIBLE memory. Binding that memory directly to dwm's
+    // sampled image forces either an illegal device-local bind (VUID-01615 →
+    // black desktop) or a linear image whose driver-chosen row pitch cannot
+    // match the executor's fixed cross_adapter_pitch (diagonal shear). Instead,
+    // import the host-visible bytes as a BUFFER and copy them — pitch-correct —
+    // into a private device-local OPTIMAL sampled image each frame (see
+    // DxvkContext::acquireSharedImagesFromExternal). Gate tightly: only 2D,
+    // single mip/layer/sample, 4-byte-per-texel (BGRA-class) host-visible
+    // imports, because the executor always writes 4 bytes/texel at a
+    // round_up(width*4,256) byte stride.
+    if (useHeliosRendererExternalMemory
+     && m_info.sharing.mode == DxvkSharedHandleMode::Import
+     && m_info.sharing.heliosResourceId
+     && m_info.sharing.heliosAllocSize
+     && m_info.type == VK_IMAGE_TYPE_2D
+     && m_info.mipLevels == 1u
+     && m_info.numLayers == 1u
+     && m_info.sampleCount == VK_SAMPLE_COUNT_1_BIT
+     && lookupFormatInfo(m_info.format)->elementSize == 4u
+     && m_allocator->isHostVisibleMemoryType(m_info.sharing.heliosMemoryTypeIndex)) {
+      // Best-effort: ANY failure here — importVenusStagingBuffer returning null
+      // OR throwing — must fall through to the direct host-visible import path
+      // below, never fail this texture's creation. A failed OpenSharedResource
+      // crash-loops dwm (0x8898008d fail-fast); a sheared-but-present fallback
+      // is strictly better. The staged path is committed to (flags flipped)
+      // only after every fallible step has succeeded.
+      try {
+        auto stagingAlloc = m_allocator->importVenusStagingBuffer(
+          m_info.sharing.heliosAllocSize,
+          m_info.sharing.heliosMemoryTypeIndex,
+          m_info.sharing.heliosResourceId);
+
+        if (stagingAlloc) {
+          DxvkBufferCreateInfo bufferInfo = { };
+          bufferInfo.size   = m_info.sharing.heliosAllocSize;
+          bufferInfo.usage  = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+          bufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          bufferInfo.access = VK_ACCESS_TRANSFER_READ_BIT;
+
+          Rc<DxvkBuffer> staging = new DxvkBuffer(m_allocator->device(),
+            bufferInfo, std::move(stagingAlloc), *m_allocator,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+          // All fallible steps done — commit to the staged path. The sampled
+          // image is now a private device-local surface: drop the
+          // external-memory setup so it allocates ordinary device-local memory.
+          m_heliosStagingBuffer = std::move(staging);
+          m_heliosGdiStaged = true;
+          useHeliosRendererExternalMemory = false;
+
+          Logger::info(str::format("DxvkImage: GDI staging enabled (", m_info.extent.width,
+            "x", m_info.extent.height, ", resid ", m_info.sharing.heliosResourceId, ")"));
+        } else {
+          Logger::warn("DxvkImage: GDI staging buffer import failed, "
+            "falling back to direct host-visible image import");
+        }
+      } catch (const DxvkError& e) {
+        Logger::warn(str::format("DxvkImage: GDI staging setup failed, "
+          "falling back to direct import: ", e.message()));
+        m_heliosStagingBuffer = nullptr;
+        m_heliosGdiStaged = false;
+      }
+    }
 
     // Set up external memory parameters for shared images
     VkExternalMemoryImageCreateInfo externalInfo = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };

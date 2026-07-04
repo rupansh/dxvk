@@ -1292,6 +1292,37 @@ namespace dxvk {
             VkImage                     imageHandle);
 
     /**
+     * \brief Whether a memory type index is host-visible
+     *
+     * Helios GDI staging: used to distinguish the KMD's host-visible standard
+     * allocations (written linearly by the kernel GDI executor through the BAR)
+     * from ordinary device-local shared textures.
+     * \param [in] index Memory type index
+     * \returns \c true if the type has HOST_VISIBLE set
+     */
+    bool isHostVisibleMemoryType(uint32_t index) const;
+
+    /**
+     * \brief Imports a Venus resource as a host-visible staging buffer
+     *
+     * Helios GDI staging (approach A): imports the creator's host-visible venus
+     * memory (the executor's linear BGRA bytes) as a \c VkBuffer instead of an
+     * image, so the pitch can be stated explicitly on a later
+     * \c vkCmdCopyBufferToImage into a private device-local sampled image. A
+     * linear buffer accepts the host-visible memory type that an OPTIMAL
+     * device-local image rejects (VUID-01615), and unlike a linear image its
+     * source row pitch is caller-chosen, not driver-chosen.
+     * \param [in] allocSize Creator's exact venus allocation size
+     * \param [in] memoryTypeIndex Creator's host-visible memory type index
+     * \param [in] resourceId Venus resource id to import
+     * \returns Owning allocation, or null on failure (caller must fall back)
+     */
+    Rc<DxvkResourceAllocation> importVenusStagingBuffer(
+            VkDeviceSize                allocSize,
+            uint32_t                    memoryTypeIndex,
+            uint32_t                    resourceId);
+
+    /**
      * \brief Queries memory stats
      * 
      * Returns the total amount of memory
