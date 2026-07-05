@@ -7,6 +7,7 @@
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
+#include "dxvk_helios_present_sync.h"
 
 namespace dxvk {
   
@@ -9405,6 +9406,88 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::heliosPresentWaitBeforeRefresh(const Rc<DxvkImage>& image) {
+    const int32_t waitUs = m_device->config().heliosPresentWaitUs;
+
+    if (waitUs <= 0)
+      return;
+
+    // Only reads of surfaces THIS process imported are consumer reads; the
+    // creator's own refresh enrollments (dwm's GDI staging) must never pick
+    // up a blocking wait from here.
+    if (image->info().sharing.mode != DxvkSharedHandleMode::Import)
+      return;
+
+    const uint32_t resid = image->info().sharing.heliosResourceId;
+
+    uint32_t pid = 0u;
+    uint64_t value = 0u;
+
+    if (!resid || !HeliosPresentSync::lookup(resid, &pid, &value))
+      return;
+
+    auto& entry = m_heliosPresentWaitFences[pid];
+
+    if (entry.fence == nullptr) {
+      if (entry.retryCountdown > 0u) {
+        entry.retryCountdown -= 1u;
+        return;
+      }
+
+      // Import the producer's named present fence. A dead producer (stale
+      // slot) makes the name unresolvable: negative-cache with periodic
+      // retry so a respawned producer with a recycled pid still connects.
+      const std::wstring name = L"Global\\HeliosPresentFence_" + std::to_wstring(pid);
+
+      try {
+        DxvkFenceCreateInfo fenceInfo = { };
+        fenceInfo.initialValue = 0u;
+        fenceInfo.sharedType   = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+        fenceInfo.ntImportName = name.c_str();
+        entry.fence = m_device->createFence(fenceInfo);
+        Logger::info(str::format("Helios present-wait: imported fence of producer pid ", pid));
+      } catch (const DxvkError& e) {
+        entry.retryCountdown = 256u;
+        static uint32_t s_importFails = 0u;
+        const uint32_t n = ++s_importFails;
+        if (n == 1u || (n % 64u) == 0u) {
+          Logger::warn(str::format("Helios present-wait: import of producer pid ",
+            pid, " fence FAILED (x", n, "): ", e.message()));
+        }
+        return;
+      }
+    }
+
+    if (entry.fence->getValue() >= value)
+      return;
+
+    const auto t0 = dxvk::high_resolution_clock::now();
+    const VkResult vr = entry.fence->waitBounded(value, uint64_t(waitUs) * 1000u);
+    const auto t1 = dxvk::high_resolution_clock::now();
+
+    m_heliosPresentWaits += 1u;
+    m_heliosPresentWaitUsTotal += uint64_t(
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+
+    if (vr != VK_SUCCESS) {
+      // Copy anyway — a rare one-frame ghost self-heals at the next acquire;
+      // wedging the IDD never does. VK_TIMEOUT here with a healthy producer
+      // means the wait budget is too small for real GPU work; anything else
+      // is a broken retire chain and must stay loud.
+      m_heliosPresentWaitTimeouts += 1u;
+      Logger::warn(str::format("Helios present-wait: resid ", resid,
+        " value ", value, " NOT reached (", vr, ") within ", waitUs,
+        "us — copying anyway (x", m_heliosPresentWaitTimeouts, ")"));
+    }
+
+    if ((m_heliosPresentWaits % 128u) == 0u) {
+      Logger::info(str::format("present-wait: waits=", m_heliosPresentWaits,
+        " avg_us=", m_heliosPresentWaitUsTotal / m_heliosPresentWaits,
+        " timeouts=", m_heliosPresentWaitTimeouts));
+    }
+  }
+
+
   void DxvkContext::refreshHeliosStagedImages() {
     // Helios GDI staging (approach A): before this command list samples the
     // staged shared surfaces it consumed in the previous list, copy the
@@ -9455,6 +9538,14 @@ namespace dxvk {
         ++entry;
         continue;
       }
+
+      // WS1 #4 consumer-side ordering: before recording this list's read of
+      // the imported surface, wait (bounded) until the producer's published
+      // present-fence value for this resid has retired at HOST GPU
+      // completion. Config-gated (heliosPresentWaitUs; on by default only in
+      // the WUDFHost/IddCx profile) and self-throttling: once a published
+      // value has signaled, re-checks are a single vkGetSemaphoreCounterValue.
+      heliosPresentWaitBeforeRefresh(image);
 
       VkImageSubresourceLayers subresource = { };
       subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;

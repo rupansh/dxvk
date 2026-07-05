@@ -131,6 +131,20 @@ namespace dxvk {
     bool HeliosWaitFrameComplete(uint64_t TimeoutUs);
 
     /**
+     * \brief Helios: record a present-fence signal on the open command list
+     *
+     * Emits a timeline-semaphore signal that rides the CURRENT recording
+     * chunk, i.e. it submits WITH the frame's remaining work and signals —
+     * at host GPU completion, via the ICD's ring>=1 wire fence + retire
+     * thread — once everything recorded so far has executed (WS1 #4
+     * producer side). No flush and no wait happen here: the present path's
+     * existing Flush right after this call submits frame + signal together.
+     */
+    void HeliosSignalPresentFence(
+      const Rc<DxvkFence>&        Fence,
+            uint64_t              Value);
+
+    /**
      * \brief Helios: inject a command ordered after all recorded work
      *
      * Dispatches the current recording chunk to the CS queue, then appends

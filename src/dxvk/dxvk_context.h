@@ -1437,6 +1437,18 @@ namespace dxvk {
     std::unordered_map<uint32_t, uint32_t>    m_heliosStagedProbeTicks;
     uint32_t                                  m_heliosStagedProbesIssued = 0u;
 
+    /* Helios WS1 #4 consumer-side present wait (dxvk.heliosPresentWaitUs).
+     * Named present fences imported once per producer pid; negative cache
+     * (null fence) for unresolvable names with periodic retry. */
+    struct HeliosPresentWaitFence {
+      Rc<DxvkFence> fence;
+      uint32_t      retryCountdown = 0u;
+    };
+    std::unordered_map<uint32_t, HeliosPresentWaitFence> m_heliosPresentWaitFences;
+    uint64_t                                  m_heliosPresentWaits        = 0u;
+    uint64_t                                  m_heliosPresentWaitUsTotal  = 0u;
+    uint64_t                                  m_heliosPresentWaitTimeouts = 0u;
+
     DxvkDescriptorCopyWorker m_descriptorWorker;
 
     Rc<DxvkLatencyTracker>  m_latencyTracker;
@@ -1999,6 +2011,9 @@ namespace dxvk {
             DxvkImage&                image);
 
     void refreshHeliosStagedImages();
+
+    void heliosPresentWaitBeforeRefresh(
+      const Rc<DxvkImage>&      image);
 
     void releaseSharedImagesToExternal();
 

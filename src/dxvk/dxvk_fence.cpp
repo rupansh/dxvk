@@ -14,6 +14,15 @@ namespace dxvk {
     VkExportSemaphoreCreateInfo exportInfo = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
     exportInfo.handleTypes = info.sharedType;
 
+    // Helios named NT export (WS1 #4): the ICD publishes the WDDM sync under
+    // this kernel object name at creation time (D3DKMTShareObjects with a
+    // named OBJECT_ATTRIBUTES); consumers import by name — no handle ever
+    // travels between processes.
+    VkExportSemaphoreWin32HandleInfoKHR exportNameInfo = { VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
+    exportNameInfo.pAttributes = reinterpret_cast<const SECURITY_ATTRIBUTES*>(info.ntSecurityAttributes);
+    exportNameInfo.dwAccess    = GENERIC_ALL;
+    exportNameInfo.name        = info.ntExportName;
+
     VkExternalSemaphoreFeatureFlags externalFeatures = 0;
 
     if (info.sharedType != VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FLAG_BITS_MAX_ENUM) {
@@ -28,10 +37,16 @@ namespace dxvk {
 
       externalFeatures = externalProperties.externalSemaphoreFeatures;
 
-      if (externalFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT)
-        typeInfo.pNext = &exportInfo;
-      else
+      if (externalFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT) {
+        // Name-imports need no export chain; everything else exports.
+        if (!info.ntImportName) {
+          typeInfo.pNext = &exportInfo;
+          if (info.ntExportName)
+            exportInfo.pNext = &exportNameInfo;
+        }
+      } else {
         Logger::warn(str::format("Exporting semaphores of type ", info.sharedType, " not supported by device"));
+      }
     }
 
     VkSemaphoreCreateInfo semaphoreInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &typeInfo };
@@ -42,12 +57,18 @@ namespace dxvk {
     if (vr != VK_SUCCESS)
       throw DxvkError("Failed to create timeline semaphore");
 
-    if (info.sharedHandle != INVALID_HANDLE_VALUE) {
+    if (info.sharedHandle != INVALID_HANDLE_VALUE || info.ntImportName) {
       if (externalFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) {
         VkImportSemaphoreWin32HandleInfoKHR importInfo = { VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
         importInfo.semaphore = m_semaphore;
         importInfo.handleType = info.sharedType;
-        importInfo.handle = info.sharedHandle;
+
+        if (info.ntImportName) {
+          importInfo.handle = nullptr;
+          importInfo.name = info.ntImportName;
+        } else {
+          importInfo.handle = info.sharedHandle;
+        }
 
         vr = m_vkd->vkImportSemaphoreWin32HandleKHR(m_vkd->device(), &importInfo);
         if (vr != VK_SUCCESS)
@@ -57,7 +78,11 @@ namespace dxvk {
       }
     }
 
-    if (info.sharedType != VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FLAG_BITS_MAX_ENUM)
+    // Named fences need no D3DKMT local-handle bookkeeping: the producer
+    // signals via queue submission, the consumer waits via vkWaitSemaphores,
+    // and the rendezvous is the kernel object name itself.
+    if (info.sharedType != VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_FLAG_BITS_MAX_ENUM
+     && !info.ntExportName && !info.ntImportName)
       initKmtHandles();
   }
 
@@ -108,6 +133,15 @@ namespace dxvk {
     if (vr != VK_SUCCESS) {
       Logger::err(str::format("Failed to wait for semaphore: ", vr));
     }
+  }
+
+
+  VkResult DxvkFence::waitBounded(uint64_t value, uint64_t timeoutNs) {
+    VkSemaphoreWaitInfo waitInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    waitInfo.semaphoreCount = 1;
+    waitInfo.pSemaphores = &m_semaphore;
+    waitInfo.pValues = &value;
+    return m_vkd->vkWaitSemaphores(m_vkd->device(), &waitInfo, timeoutNs);
   }
 
   void DxvkFence::run() {

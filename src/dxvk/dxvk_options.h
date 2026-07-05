@@ -51,6 +51,13 @@ namespace dxvk {
     /// Latency tolerance, in microseconds
     int32_t latencyTolerance = 0u;
 
+    /// Helios WS1 #4 consumer-side present wait: before refreshing an
+    /// IMPORTED shared surface, wait (bounded, microseconds) for the
+    /// producer's published present-fence value. 0 disables. Defaulted on
+    /// only for the IddCx consumer (WUDFHost profile) — a producer-side
+    /// process must never grow a blocking CS-thread wait from this.
+    int32_t heliosPresentWaitUs = 0;
+
     /// Disable VK_NV_low_latency2. This extension
     /// appears to be all sorts of broken on 32-bit.
     Tristate disableNvLowLatency2 = Tristate::Auto;

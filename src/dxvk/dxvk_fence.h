@@ -28,6 +28,19 @@ namespace dxvk {
       // we could add a `int fd` here, etc.
       HANDLE          sharedHandle = INVALID_HANDLE_VALUE;
     };
+    // Helios named NT sharing (WS1 #4). At most one may be set, and only
+    // with sharedType = OPAQUE_WIN32 (monitored fences have no KMT flavor):
+    //  - ntExportName: publish the created semaphore's WDDM sync under this
+    //    kernel object name (e.g. L"Global\\HeliosPresentFence_1234");
+    //    ntSecurityAttributes (a SECURITY_ATTRIBUTES*) supplies the DACL a
+    //    cross-principal consumer needs to open it.
+    //  - ntImportName: import an existing named sync into this semaphore
+    //    (VkImportSemaphoreWin32HandleInfoKHR::name, null handle).
+    // Named fences skip the D3DKMT local-handle bookkeeping (kmtLocal/
+    // kmtGlobal stay 0) — signal and wait ride the Vulkan semaphore only.
+    const wchar_t*  ntExportName = nullptr;
+    const wchar_t*  ntImportName = nullptr;
+    const void*     ntSecurityAttributes = nullptr;
   };
 
   /**
@@ -115,6 +128,17 @@ namespace dxvk {
      * \param [in] value Value to wait for
     */
     void wait(uint64_t value);
+
+    /**
+     * \brief Bounded wait for the given value
+     *
+     * Never blocks past the timeout — the Helios consumer-side present
+     * wait proceeds (loudly) on VK_TIMEOUT instead of wedging the IDD.
+     * \param [in] value Value to wait for
+     * \param [in] timeoutNs Wait budget in nanoseconds
+     * \returns VK_SUCCESS, VK_TIMEOUT, or an error
+     */
+    VkResult waitBounded(uint64_t value, uint64_t timeoutNs);
 
   private:
 
