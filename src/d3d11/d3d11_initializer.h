@@ -69,6 +69,17 @@ namespace dxvk {
     void InitHeliosStagedTexture(
             D3D11CommonTexture*         pTexture);
 
+    /**
+     * \brief Clears a Helios debug-magenta private texture to solid magenta
+     *
+     * Localization diagnostic (HELIOS_DEBUG_MAGENTA): stands in for a
+     * device-local shared import so we can tell whether dwm samples the exact
+     * image we hand it (magenta shows) or a different surface (still black).
+     * No-op unless the texture is a Helios debug-magenta image.
+     */
+    void InitHeliosMagentaTexture(
+            D3D11CommonTexture*         pTexture);
+
     void InitUavCounter(
             D3D11UnorderedAccessView*   pUav);
     

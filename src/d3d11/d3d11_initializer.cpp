@@ -62,22 +62,29 @@ namespace dxvk {
     if (image == nullptr || !image->isHeliosGdiStaged())
       return;
 
-    Rc<DxvkBuffer> staging = image->heliosStagingBuffer();
+    Rc<DxvkBuffer> staging      = image->heliosStagingBuffer();
+    Rc<DxvkImage>  stagingImage = image->heliosStagingImage();
 
-    if (staging == nullptr)
+    if (staging == nullptr && stagingImage == nullptr)
       return;
 
     std::lock_guard<dxvk::mutex> lock(m_mutex);
     m_transferCommands += 1;
 
-    // The kernel GDI executor writes 4 bytes/texel at a round_up(width*4,256)
-    // byte stride; a row alignment of the cross-adapter pitch alignment (256)
-    // reproduces that exact source pitch in copyImageBufferData. This transition
-    // (UNDEFINED->GENERAL) + fill runs on the initializer's CS chunk, which is
-    // ordered before the texture's first use on the immediate context.
+    // Transition (UNDEFINED->GENERAL) + fill the staged image before its first
+    // sample. Opened shared textures skip the normal InitTexture path, so without
+    // this a freshly-opened staged image is sampled in UNDEFINED layout at the
+    // composition draw (host vkr: "expects GENERAL, current UNDEFINED") and NVIDIA
+    // reads undefined memory (garbage). Host-visible surfaces fill from the
+    // imported staging buffer (LINEAR, 256-aligned executor rows); device-local
+    // surfaces fill by image copy from the direct-bind alias (the blob holds the
+    // host driver's OPTIMAL tiled layout — only an image read decodes it). Runs
+    // on the initializer's CS chunk, ordered before the texture's first use on
+    // the immediate context.
     EmitCs([
-      cImage   = std::move(image),
-      cStaging = std::move(staging)
+      cImage        = std::move(image),
+      cStaging      = std::move(staging),
+      cStagingImage = std::move(stagingImage)
     ] (DxvkContext* ctx) {
       VkImageSubresourceLayers subresource = { };
       subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -85,9 +92,62 @@ namespace dxvk {
       subresource.baseArrayLayer = 0u;
       subresource.layerCount     = 1u;
 
-      ctx->copyBufferToImage(cImage, subresource,
-        VkOffset3D { 0, 0, 0 }, cImage->mipLevelExtent(0u),
-        cStaging, 0u, 256u, 0u, cImage->info().format);
+      if (cStagingImage != nullptr) {
+        ctx->copyImage(cImage, subresource, VkOffset3D { 0, 0, 0 },
+          cStagingImage, subresource, VkOffset3D { 0, 0, 0 },
+          cImage->mipLevelExtent(0u));
+      } else {
+        ctx->copyBufferToImage(cImage, subresource,
+          VkOffset3D { 0, 0, 0 }, cImage->mipLevelExtent(0u),
+          cStaging, 0u, cImage->heliosStagedRowAlign(), 0u, cImage->info().format);
+      }
+    });
+
+    ThrottleAllocationLocked();
+  }
+
+
+  void D3D11Initializer::InitHeliosMagentaTexture(
+          D3D11CommonTexture*         pTexture) {
+    Rc<DxvkImage> image = pTexture->GetImage();
+
+    if (image == nullptr || !image->isHeliosDebugMagenta())
+      return;
+
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    m_transferCommands += 1;
+
+    // Localization diagnostic: clear the private stand-in image to solid opaque
+    // magenta on the initializer's CS chunk (ordered before dwm's first sample).
+    // If the desktop shows magenta, dwm samples this exact image and the black is
+    // a content-delivery bug on the device-local shared-import path.
+    EmitCs([
+      cImage = std::move(image)
+    ] (DxvkContext* ctx) {
+      DxvkImageViewKey viewKey;
+      viewKey.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+      viewKey.usage      = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      viewKey.format     = cImage->info().format;
+      viewKey.layout     = VK_IMAGE_LAYOUT_GENERAL;
+      viewKey.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
+      viewKey.mipIndex   = 0u;
+      viewKey.mipCount   = 1u;
+      viewKey.layerIndex = 0u;
+      viewKey.layerCount = 1u;
+
+      Rc<DxvkImageView> view = cImage->createView(viewKey);
+
+      VkClearValue clearValue = { };
+      clearValue.color.float32[0] = 1.0f;  // R
+      clearValue.color.float32[1] = 0.0f;  // G
+      clearValue.color.float32[2] = 1.0f;  // B  -> opaque magenta
+      clearValue.color.float32[3] = 1.0f;  // A
+
+      ctx->clearImageView(view,
+        VkOffset3D { 0, 0, 0 },
+        cImage->mipLevelExtent(0u),
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        clearValue);
     });
 
     ThrottleAllocationLocked();

@@ -1522,20 +1522,40 @@ namespace dxvk {
     dedicatedInfo.buffer = buffer;
 
     DxvkAllocationInfo allocationInfo = { };
-    // Deliberately request NO memory properties. Two reasons:
-    //  1. We must NOT map this memory on the guest. allocateDedicatedMemory
-    //     calls mapDeviceMemory whenever properties has HOST_VISIBLE, and
-    //     vkMapMemory on an IMPORTED venus resource fails with
-    //     VK_ERROR_MEMORY_MAP_FAILED (the imported blob's guest mapping isn't
-    //     set up like a natively-allocated host-visible blob) — that throw is
-    //     what crash-looped dwm. The staging buffer is only ever read
-    //     device-side by vkCmdCopyBufferToImage, so it needs no CPU mapping.
-    //  2. properties==0 makes getMemoryTypeMask(0) return every system-memory
-    //     type, so intersecting with the requirement mask (now just typeBit)
-    //     still selects exactly the host-visible import type. This mirrors how
-    //     the image-import path reaches the host-visible type via its
-    //     device-local-stripped fallback (which also never maps).
-    allocationInfo.properties = 0u;
+    // Derive the allocation properties from the import memory type, then STRIP the
+    // host-visible flags. Two constraints:
+    //  1. We must NOT map this memory on the guest. allocateDedicatedMemory calls
+    //     mapDeviceMemory whenever properties has HOST_VISIBLE, and vkMapMemory on
+    //     an IMPORTED venus resource throws VK_ERROR_MEMORY_MAP_FAILED (the blob's
+    //     guest mapping isn't set up like a native host-visible blob) — that throw
+    //     crash-looped dwm. The staging buffer is only ever read device-side by
+    //     vkCmdCopyBufferToImage, so it needs no CPU mapping. Stripping the
+    //     host-visible/coherent/cached bits guarantees no map is attempted.
+    //  2. allocateDedicatedMemory intersects the (forced) typeBit with
+    //     getMemoryTypeMask(properties). getMemoryTypeMask(0) returns only
+    //     SYSTEM-memory (host-visible) types, so for a DEVICE-LOCAL import type 0
+    //     yields an empty intersection and the allocation FAILS ("failed to import
+    //     dedicated memory") — which is why device-local buffer imports fell back
+    //     to the black direct-import. Keeping DEVICE_LOCAL (from the type's own
+    //     flags) makes getMemoryTypeMask include the device-local type; a
+    //     host-visible-only type strips to 0 and still resolves via the system
+    //     mask, so this is correct for BOTH host-visible and device-local imports.
+    VkMemoryPropertyFlags typeProps = m_memTypes[memoryTypeIndex].properties.propertyFlags;
+    if (typeProps & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+      // Host-visible import (incl. NVIDIA ReBAR host-visible+DEVICE_LOCAL): keep
+      // the original properties==0. getMemoryTypeMask(0) already includes every
+      // host-visible/system type, and 0 never maps. Setting DEVICE_LOCAL here
+      // instead perturbed the ReBAR taskbar allocation and sheared it.
+      allocationInfo.properties = 0u;
+    } else {
+      // Pure device-local import (app render targets): 0 would select only
+      // system memory and FAIL, so keep DEVICE_LOCAL (from the type's own flags)
+      // — with the host-visible bits stripped, no map is ever attempted.
+      allocationInfo.properties = typeProps
+        & ~(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+          | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+          | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    }
 
     Rc<DxvkResourceAllocation> allocation = allocateDedicatedMemory(
       requirements.memoryRequirements, allocationInfo, &dedicatedInfo);

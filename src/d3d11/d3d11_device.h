@@ -439,6 +439,11 @@ namespace dxvk {
       m_initializer->InitHeliosStagedTexture(pTexture);
     }
 
+    void InitializeMagentaTexture(
+            D3D11CommonTexture*         pTexture) {
+      m_initializer->InitHeliosMagentaTexture(pTexture);
+    }
+
     VkPipelineStageFlags GetEnabledShaderStages() const {
       return m_dxvkDevice->getShaderPipelineStages();
     }

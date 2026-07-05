@@ -183,6 +183,23 @@ namespace dxvk {
       imageInfo.shared = VK_TRUE;
     }
 
+    // Helios copy-free cross-process fix (13th session): a shared OPTIMAL image
+    // and its cross-process importer alias one host allocation, but NVIDIA color
+    // compression (DCC) keeps a PER-IMAGE compression-control surface that is NOT
+    // carried across the OPAQUE_FD share — so the importer decodes the exporter's
+    // compressed bytes with empty metadata and samples black (the black desktop),
+    // even though every VkImageCreateInfo field matches. Dropping the view-format
+    // list (while KEEPING VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT so sRGB/UNORM views
+    // still work) forces the driver to store the image uncompressed: the raw
+    // pixels then live directly in the shared memory and the matching-create-info
+    // importer reads them with NO per-frame copy. Applied to both endpoints (this
+    // is the single InitImageInfo both the exporter and importer run through), so
+    // creator and opener stay byte-identical.
+    if (imageInfo.shared && (imageInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
+      imageInfo.viewFormatCount = 0;
+      imageInfo.viewFormats     = nullptr;
+    }
+
     // Some image formats (i.e. the R32G32B32 ones) are
     // only supported with linear tiling on most GPUs
     if (!CheckImageSupport(&imageInfo, VK_IMAGE_TILING_OPTIMAL))
@@ -280,16 +297,21 @@ namespace dxvk {
       ExportImageInfo();
     }
 
-    // Helios GDI staging: opened shared textures skip the normal InitTexture
-    // path (their content usually lives in imported memory). A staged texture
-    // is instead a private device-local surface that must be transitioned to
-    // GENERAL and filled from its staging buffer BEFORE dwm can sample it —
-    // otherwise the host image is sampled while still UNDEFINED
-    // (VUID-vkCmdDraw-None-09600) and NVIDIA loses the device. The init copy is
-    // recorded on the initializer's CS chunk, ordered before the texture's
-    // first use on the immediate context.
+    // Helios staged-texture init: transition the staged image to GENERAL and fill
+    // it before dwm's first sample. Required (re-enabled 13th session): with
+    // device-local staging active, MANY staged surfaces open, and each is sampled
+    // UNDEFINED on its first frame without this (host vkr: "expects GENERAL,
+    // current UNDEFINED" -> garbage). Fix A alone (m_globalLayout=initialLayout)
+    // does not reliably get the transition emitted before the composition draw.
     if (m_image != nullptr && m_image->isHeliosGdiStaged())
       m_device->InitializeStagedTexture(this);
+
+    // Helios magenta localization diagnostic: a private device-local image
+    // standing in for a device-local shared import (HELIOS_DEBUG_MAGENTA) is
+    // never initialized by the normal open path, so clear it to solid magenta
+    // here so dwm samples magenta instead of an UNDEFINED/black surface.
+    if (m_image != nullptr && m_image->isHeliosDebugMagenta())
+      m_device->InitializeMagentaTexture(this);
   }
 
 
