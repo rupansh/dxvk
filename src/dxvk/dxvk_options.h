@@ -52,11 +52,16 @@ namespace dxvk {
     int32_t latencyTolerance = 0u;
 
     /// Helios WS1 #4 consumer-side present wait: before refreshing an
-    /// IMPORTED shared surface, wait (bounded, microseconds) for the
-    /// producer's published present-fence value. 0 disables. Defaulted on
-    /// only for the IddCx consumer (WUDFHost profile) — a producer-side
-    /// process must never grow a blocking CS-thread wait from this.
-    int32_t heliosPresentWaitUs = 0;
+    /// IMPORTED shared surface with a published present-fence slot, wait
+    /// (bounded, microseconds) for the producer's published value. 0
+    /// disables. On for EVERY consumer by default: WUDFHost ordering its
+    /// copy against dwm is not enough — dwm composing app backbuffers has
+    /// the same producer/consumer race (proven live 2026-07-06: with the
+    /// per-present gate registry-disabled, stale/torn app content reappeared
+    /// in dwm's OWN composition). The wait DAG is acyclic (IDD -> dwm ->
+    /// apps) and every edge is bounded; it only ever fires for cross-process
+    /// imports that actually publish (dwm/IDD paths, not game textures).
+    int32_t heliosPresentWaitUs = 32000;
 
     /// Disable VK_NV_low_latency2. This extension
     /// appears to be all sorts of broken on 32-bit.

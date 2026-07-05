@@ -20,19 +20,6 @@ namespace dxvk {
 
   const static ProfileList g_profiles = {
     /**********************************************/
-    /* HELIOS SYSTEM PROCESSES                    */
-    /**********************************************/
-
-    /* WUDFHost hosts the LGIdd IddCx driver, whose per-acquire copy of
-     * dwm's presented backbuffers runs on this engine. Enable the bounded
-     * consumer-side present wait (WS1 #4) here ONLY: the refresh path
-     * would otherwise add a blocking CS-thread wait to every process that
-     * imports shared surfaces — including dwm itself. */
-    { R"(\\WUDFHost\.exe$)", {{
-      { "dxvk.heliosPresentWaitUs",       "100000" },
-    }} },
-
-    /**********************************************/
     /* D3D12 GAMES (vkd3d-proton with dxvk dxgi)  */
     /**********************************************/
 

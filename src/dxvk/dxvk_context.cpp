@@ -9483,7 +9483,8 @@ namespace dxvk {
       // is a broken retire chain and must stay loud.
       m_heliosPresentWaitTimeouts += 1u;
       Logger::warn(str::format("Helios present-wait: resid ", resid,
-        " value ", value, " NOT reached (", vr, ") within ", waitUs,
+        " value ", value, " NOT reached (", vr, ", fence at ",
+        entry.fence->getValue(), ") within ", waitUs,
         "us — copying anyway (x", m_heliosPresentWaitTimeouts, ")"));
     }
 
