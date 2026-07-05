@@ -930,6 +930,43 @@ namespace dxvk {
   }
 
 
+  bool D3D11ImmediateContext::HeliosWaitFrameComplete(uint64_t TimeoutUs) {
+    uint64_t submissionId;
+
+    {
+      D3D10DeviceLock lock = LockContext();
+
+      // Dispatch + submit pending work. If nothing is pending, ExecuteFlush
+      // is a no-op and m_submissionId names the LAST flush — waiting for it
+      // still gives "everything presented so far is GPU-final".
+      ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false);
+      submissionId = m_submissionId;
+    }
+
+    if (m_submissionFence->value() >= submissionId)
+      return true;
+
+    // Bounded poll outside the context lock. The typical completion is a few
+    // ms; stay hot briefly, then yield. No Sleep(1): its ~15.6 ms timer
+    // quantization is what dominated the old whole-device drain.
+    auto deadline = dxvk::high_resolution_clock::now()
+                  + std::chrono::microseconds(TimeoutUs);
+
+    for (uint32_t spin = 0; m_submissionFence->value() < submissionId; ++spin) {
+      if ((spin & 0x3ff) == 0x3ff
+       && dxvk::high_resolution_clock::now() >= deadline)
+        return false;
+
+      if (spin < 1024)
+        dxvk::this_thread::yield();
+      else
+        ::Sleep(0);
+    }
+
+    return true;
+  }
+
+
   void D3D11ImmediateContext::InjectCsChunk(
           DxvkCsQueue                 Queue,
           DxvkCsChunkRef&&            Chunk,
