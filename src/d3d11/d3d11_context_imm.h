@@ -112,6 +112,43 @@ namespace dxvk {
       InjectCsChunk(Queue, std::move(chunk), false);
     }
 
+    /**
+     * \brief Helios: bounded wait for the current frame's GPU completion
+     *
+     * Flushes pending work and waits — bounded by \c TimeoutUs — until the
+     * flush's submission completes on the GPU (m_submissionFence reaches the
+     * flush's submission id; the fence signals at GPU completion, the same
+     * mechanism as the frame-latency event). Present-path ordering: nothing
+     * in this stack makes dwm's venus rendering visible to dxgkrnl as DMA,
+     * so no fence orders the IddCx consumer's copy against in-flight GPU
+     * writes of the just-presented buffer — the gate closes that window
+     * deterministically when it completes in time. On timeout (CS backlog /
+     * slow GPU) it returns false and the caller proceeds: a rare one-frame
+     * ghost self-heals at the next per-acquire refresh, and presents stay
+     * bounded instead of reintroducing multi-second churn dips.
+     * \returns \c true if the frame completed within the timeout
+     */
+    bool HeliosWaitFrameComplete(uint64_t TimeoutUs);
+
+    /**
+     * \brief Helios: inject a command ordered after all recorded work
+     *
+     * Dispatches the current recording chunk to the CS queue, then appends
+     * the command on the ordered queue — WITHOUT synchronizing the CS
+     * thread. Plain InjectCs bypasses the open chunk (commands recorded
+     * before the call would execute after it); SynchronizeCsThread gives
+     * the same ordering but blocks the caller behind the whole CS queue,
+     * which measured up to 1.9 s per present during login churn
+     * (rotate-perf, 18th session) — the "occasional framerate dips".
+     */
+    template<typename Fn>
+    void InjectCsOrderedAfterPending(Fn&& Command) {
+      D3D10DeviceLock lock = LockContext();
+
+      FlushCsChunk();
+      InjectCs(DxvkCsQueue::Ordered, std::move(Command));
+    }
+
   private:
     
     DxvkCsThread            m_csThread;
