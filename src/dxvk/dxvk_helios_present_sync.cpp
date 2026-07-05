@@ -30,7 +30,7 @@ namespace dxvk {
       volatile LONG seq;
       uint32_t      resid;
       uint32_t      pid;
-      uint32_t      reserved;
+      uint32_t      fenceId;
       volatile LONG64 value;
       uint64_t      reserved2;
     };
@@ -173,7 +173,7 @@ namespace dxvk {
   }
 
 
-  bool HeliosPresentSync::publish(uint32_t resid, uint32_t pid, uint64_t value) {
+  bool HeliosPresentSync::publish(uint32_t resid, uint32_t pid, uint32_t fenceId, uint64_t value) {
     std::call_once(g_mapOnce, initMapping);
 
     if (!g_map.slots || !resid)
@@ -195,13 +195,14 @@ namespace dxvk {
     // there is no writer-writer race past the claim.
     ::InterlockedIncrement(&slot->seq);            // -> odd
     slot->pid = pid;
+    slot->fenceId = fenceId;
     slot->value = LONG64(value);
     ::InterlockedIncrement(&slot->seq);            // -> even
     return true;
   }
 
 
-  bool HeliosPresentSync::lookup(uint32_t resid, uint32_t* pid, uint64_t* value) {
+  bool HeliosPresentSync::lookup(uint32_t resid, uint32_t* pid, uint32_t* fenceId, uint64_t* value) {
     std::call_once(g_mapOnce, initMapping);
 
     if (!g_map.slots || !resid)
@@ -216,11 +217,13 @@ namespace dxvk {
       if (seq0 & 1)
         continue;
       const uint32_t p = slot->pid;
+      const uint32_t f = slot->fenceId;
       const uint64_t v = uint64_t(::InterlockedCompareExchange64(&slot->value, 0, 0));
       const LONG seq1 = ::InterlockedCompareExchange(&slot->seq, 0, 0);
       if (seq0 != seq1 || slot->resid != resid)
         continue;
       *pid = p;
+      *fenceId = f;
       *value = v;
       return p != 0;
     }

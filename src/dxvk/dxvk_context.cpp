@@ -9421,12 +9421,17 @@ namespace dxvk {
     const uint32_t resid = image->info().sharing.heliosResourceId;
 
     uint32_t pid = 0u;
+    uint32_t fenceId = 0u;
     uint64_t value = 0u;
 
-    if (!resid || !HeliosPresentSync::lookup(resid, &pid, &value))
+    if (!resid || !HeliosPresentSync::lookup(resid, &pid, &fenceId, &value))
       return;
 
-    auto& entry = m_heliosPresentWaitFences[pid];
+    // Keyed by (pid, fenceId): one producer process owns several D3D11
+    // devices, each with its own named fence; a recreated device in the
+    // same pid gets a fresh fence id, which naturally invalidates the cache.
+    const uint64_t fenceKey = (uint64_t(pid) << 32) | fenceId;
+    auto& entry = m_heliosPresentWaitFences[fenceKey];
 
     if (entry.fence == nullptr) {
       if (entry.retryCountdown > 0u) {
@@ -9437,7 +9442,8 @@ namespace dxvk {
       // Import the producer's named present fence. A dead producer (stale
       // slot) makes the name unresolvable: negative-cache with periodic
       // retry so a respawned producer with a recycled pid still connects.
-      const std::wstring name = L"Global\\HeliosPresentFence_" + std::to_wstring(pid);
+      const std::wstring name = L"Global\\HeliosPresentFence_" + std::to_wstring(pid)
+                              + L"_" + std::to_wstring(fenceId);
 
       try {
         DxvkFenceCreateInfo fenceInfo = { };
@@ -9445,7 +9451,8 @@ namespace dxvk {
         fenceInfo.sharedType   = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
         fenceInfo.ntImportName = name.c_str();
         entry.fence = m_device->createFence(fenceInfo);
-        Logger::info(str::format("Helios present-wait: imported fence of producer pid ", pid));
+        Logger::info(str::format("Helios present-wait: imported fence ", fenceId,
+          " of producer pid ", pid));
       } catch (const DxvkError& e) {
         entry.retryCountdown = 256u;
         static uint32_t s_importFails = 0u;
