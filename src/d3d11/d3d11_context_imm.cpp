@@ -967,6 +967,20 @@ namespace dxvk {
   }
 
 
+  void D3D11ImmediateContext::HeliosSignalPresentFence(
+    const Rc<DxvkFence>&        Fence,
+          uint64_t              Value) {
+    D3D10DeviceLock lock = LockContext();
+
+    EmitCs([
+      cFence = Fence,
+      cValue = Value
+    ] (DxvkContext* ctx) {
+      ctx->signalFence(cFence, cValue);
+    });
+  }
+
+
   void D3D11ImmediateContext::InjectCsChunk(
           DxvkCsQueue                 Queue,
           DxvkCsChunkRef&&            Chunk,
