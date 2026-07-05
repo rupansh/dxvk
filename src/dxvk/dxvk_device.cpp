@@ -681,9 +681,18 @@ namespace dxvk {
     if (resource.isInUse(access)) {
       auto t0 = dxvk::high_resolution_clock::now();
 
-      m_submissionQueue.synchronizeUntil([&resource, access] {
-        return !resource.isInUse(access);
+      // HELIOS: bail out once the device is lost — after loss nothing is
+      // guaranteed to release the resource's usage refs, and an unbounded
+      // wait here wedges the calling thread for the life of the process
+      // (2026-07-05: dwm compositor stuck in Map for 25+ minutes). Mapped
+      // contents are undefined on a lost device anyway.
+      m_submissionQueue.synchronizeUntil([this, &resource, access] {
+        return !resource.isInUse(access)
+            || m_submissionQueue.getLastError() == VK_ERROR_DEVICE_LOST;
       });
+
+      if (resource.isInUse(access))
+        Logger::warn("DxvkDevice: waitForResource aborted: device lost with resource still in use");
 
       auto t1 = dxvk::high_resolution_clock::now();
       auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);

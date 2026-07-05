@@ -193,6 +193,8 @@ namespace dxvk {
         entry.status->result = entry.result;
       
       // On success, pass it on to the queue thread
+      Rc<DxvkCommandList> droppedCmdList;
+
       { std::unique_lock<dxvk::mutex> lock(m_mutex);
 
         bool doForward = (entry.result == VK_SUCCESS) ||
@@ -206,10 +208,29 @@ namespace dxvk {
 
           if (m_lastError != VK_ERROR_DEVICE_LOST)
             m_device->waitForIdle();
+
+          // HELIOS: a dropped submission still holds lifetime refs on every
+          // resource recorded into it. Without notifyObjects() those refs
+          // leak and a later waitForResource() on any of them never returns
+          // (2026-07-05: dwm compositor wedged in Map after device loss).
+          // The command list was never submitted, so its buffers are not
+          // pending and resetting them below is legal.
+          droppedCmdList = std::move(entry.submit.cmdList);
         }
 
         m_submitQueue.pop();
         m_submitCond.notify_all();
+      }
+
+      if (droppedCmdList != nullptr) {
+        droppedCmdList->notifyObjects();
+        droppedCmdList->reset();
+        m_device->recycleCommandList(droppedCmdList);
+
+        // Wake threads blocked in synchronizeUntil so they observe both the
+        // released refs and m_lastError.
+        std::unique_lock<dxvk::mutex> lock(m_mutex);
+        m_finishCond.notify_all();
       }
 
       // Good time to invoke allocator tasks now since we
@@ -244,25 +265,38 @@ namespace dxvk {
       DxvkSubmitEntry entry = std::move(m_finishQueue.front());
       lock.unlock();
       
+      bool hostRetired = true;
+
       if (entry.submit.cmdList != nullptr) {
         VkResult status = m_lastError.load();
 
-        if (status != VK_ERROR_DEVICE_LOST) {
-          std::array<VkSemaphore, 2> semaphores = { m_semaphores.graphics, m_semaphores.transfer };
-          std::array<uint64_t, 2> timelines = { entry.timelines.graphics, entry.timelines.transfer };
+        std::array<VkSemaphore, 2> semaphores = { m_semaphores.graphics, m_semaphores.transfer };
+        std::array<uint64_t, 2> timelines = { entry.timelines.graphics, entry.timelines.transfer };
 
+        VkSemaphoreWaitInfo waitInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+        waitInfo.semaphoreCount = semaphores.size();
+        waitInfo.pSemaphores = semaphores.data();
+        waitInfo.pValues = timelines.data();
+
+        if (status != VK_ERROR_DEVICE_LOST) {
           if (entry.latency.tracker)
             entry.latency.tracker->notifyGpuExecutionBegin(entry.latency.frameId);
 
-          VkSemaphoreWaitInfo waitInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
-          waitInfo.semaphoreCount = semaphores.size();
-          waitInfo.pSemaphores = semaphores.data();
-          waitInfo.pValues = timelines.data();
-
           status = vk->vkWaitSemaphores(vk->device(), &waitInfo, ~0ull);
+          hostRetired = (status == VK_SUCCESS);
 
           if (entry.latency.tracker && status == VK_SUCCESS)
             entry.latency.tracker->notifyGpuExecutionEnd(entry.latency.frameId);
+        } else {
+          // HELIOS: the guest-side loss latch (vn sem-deadline) can declare
+          // this device lost while the HOST device is healthy and still
+          // executing the submission. Resetting or destroying its command
+          // pool then is host-side UB (2026-07-05 freeze evidence:
+          // vkResetCommandPool-in-use VUs during post-loss teardown). Give
+          // the host a bounded grace to retire the work; leak the command
+          // list below if it does not.
+          hostRetired = vk->vkWaitSemaphores(vk->device(), &waitInfo,
+            2'000'000'000ull) == VK_SUCCESS;
         }
 
         if (status != VK_SUCCESS) {
@@ -292,8 +326,18 @@ namespace dxvk {
 
       // Free the command list and associated objects now
       if (entry.submit.cmdList != nullptr) {
-        entry.submit.cmdList->reset();
-        m_device->recycleCommandList(entry.submit.cmdList);
+        if (hostRetired) {
+          entry.submit.cmdList->reset();
+          m_device->recycleCommandList(entry.submit.cmdList);
+        } else {
+          // HELIOS: host work never retired (device lost). Keep the command
+          // list alive forever — resetting/destroying a pool with pending
+          // buffers corrupts the (possibly healthy) host device. Loud, and
+          // bounded in practice: device loss ends the device's useful life.
+          Logger::err("DxvkSubmissionQueue: leaking command list with unretired host work (device lost)");
+          std::unique_lock<dxvk::mutex> leakLock(m_mutex);
+          m_leakedCmdLists.push_back(std::move(entry.submit.cmdList));
+        }
       }
     }
   }

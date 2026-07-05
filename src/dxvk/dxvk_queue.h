@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <queue>
+#include <vector>
 
 #include "../util/thread.h"
 
@@ -214,6 +215,12 @@ namespace dxvk {
 
     std::queue<DxvkSubmitEntry> m_submitQueue;
     std::queue<DxvkSubmitEntry> m_finishQueue;
+
+    // HELIOS: command lists whose host work never retired before a
+    // guest-side device-loss teardown. Deliberately kept alive for the
+    // process lifetime — resetting or destroying a command pool with
+    // pending buffers is UB against a still-healthy host device.
+    std::vector<Rc<DxvkCommandList>> m_leakedCmdLists;
 
     dxvk::thread                m_submitThread;
     dxvk::thread                m_finishThread;
