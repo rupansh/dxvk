@@ -9418,13 +9418,43 @@ namespace dxvk {
     //
     // Coherence caveat: the executor writes the BAR concurrently, so a torn
     // read here is a possible minor transient — acceptable for now.
-    constexpr VkDeviceSize HeliosCrossAdapterPitchAlign = 256u;
+    //
+    // Pitch: host-visible executor surfaces use a 256-byte row alignment; a
+    // device-local venus blob is stored TIGHT (width*elementSize), so it carries
+    // its own per-image alignment (heliosStagedRowAlign) — using 256 for a
+    // tight device-local blob overruns its exact-size buffer (host vkr rejects
+    // it) and shears.
+    // Probe pacing. Ticks advance only when this context actually composites
+    // (damage-driven), so probe EARLY (tick 2 — the creator rendered before the
+    // surface was opened), at tick 120 (late writes), and every 600 refreshes
+    // (steady-state snapshots). Harvest 30 refresh calls after issue — the
+    // copy's list has long since executed by then.
+    constexpr uint32_t HeliosProbeIssueTickA  = 2u;
+    constexpr uint32_t HeliosProbeIssueTickB  = 120u;
+    constexpr uint32_t HeliosProbeRecurTick   = 600u;
+    constexpr uint32_t HeliosProbeHarvestTick = 30u;
+    constexpr uint32_t HeliosProbeMaxCount    = 48u;
+    constexpr VkDeviceSize HeliosProbeMaxSize = VkDeviceSize(16u) << 20u;
 
-    for (const auto& image : m_heliosStagedRefresh) {
-      const auto& staging = image->heliosStagingBuffer();
+    // Prune surfaces that have not been sampled for a while — they re-enroll
+    // on the next touch. Keeps the per-list copy cost bounded to live surfaces.
+    constexpr uint32_t HeliosStagedIdleLimit  = 3600u;
 
-      if (!image->isHeliosGdiStaged() || staging == nullptr)
+    for (auto entry = m_heliosStagedRefresh.begin(); entry != m_heliosStagedRefresh.end(); ) {
+      const auto& image = entry->image;
+
+      if (++entry->idleTicks > HeliosStagedIdleLimit) {
+        entry = m_heliosStagedRefresh.erase(entry);
         continue;
+      }
+
+      const auto& staging      = image->heliosStagingBuffer();
+      const auto& stagingImage = image->heliosStagingImage();
+
+      if (!image->isHeliosGdiStaged() || (staging == nullptr && stagingImage == nullptr)) {
+        ++entry;
+        continue;
+      }
 
       VkImageSubresourceLayers subresource = { };
       subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -9432,13 +9462,154 @@ namespace dxvk {
       subresource.baseArrayLayer = 0u;
       subresource.layerCount     = 1u;
 
-      copyBufferToImage(image, subresource,
-        VkOffset3D { 0, 0, 0 }, image->mipLevelExtent(0u),
-        staging, 0u, HeliosCrossAdapterPitchAlign, 0u,
-        image->info().format);
+      if (stagingImage != nullptr) {
+        // Device-local staging v2: image-to-image copy from the direct-bind
+        // alias — the only read that correctly decodes the blob's OPTIMAL
+        // (tiled) layout.
+        copyImage(image, subresource, VkOffset3D { 0, 0, 0 },
+          stagingImage, subresource, VkOffset3D { 0, 0, 0 },
+          image->mipLevelExtent(0u));
+      } else {
+        copyBufferToImage(image, subresource,
+          VkOffset3D { 0, 0, 0 }, image->mipLevelExtent(0u),
+          staging, 0u, image->heliosStagedRowAlign(), 0u,
+          image->info().format);
+      }
+
+      // Content probes: at each probe tick, read back BOTH the raw source
+      // (alias image detiled / host-visible buffer raw) and the PRIVATE image
+      // (post-copy — the exact bytes the consumer samples). Diverging results
+      // between the two isolate the copy; a full private image under a black
+      // screen isolates composition/capture downstream of us.
+      uint32_t tick = ++m_heliosStagedProbeTicks[image->info().sharing.heliosResourceId];
+
+      if ((tick == HeliosProbeIssueTickA || tick == HeliosProbeIssueTickB
+        || tick % HeliosProbeRecurTick == 0u)
+       && m_heliosStagedProbesIssued < HeliosProbeMaxCount) {
+        auto issueProbe = [&] (const char* mode, const Rc<DxvkBuffer>& srcBuffer,
+                               const Rc<DxvkImage>& srcImage) {
+          try {
+            VkDeviceSize probeSize;
+
+            if (srcImage != nullptr) {
+              VkExtent3D extent = srcImage->mipLevelExtent(0u);
+              probeSize = VkDeviceSize(extent.width) * extent.height
+                        * lookupFormatInfo(srcImage->info().format)->elementSize;
+            } else {
+              probeSize = srcBuffer->info().size;
+            }
+
+            if (!probeSize || probeSize > HeliosProbeMaxSize)
+              return;
+
+            DxvkBufferCreateInfo readbackInfo = { };
+            readbackInfo.size      = probeSize;
+            readbackInfo.usage     = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            readbackInfo.stages    = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            readbackInfo.access    = VK_ACCESS_TRANSFER_WRITE_BIT;
+            readbackInfo.debugName = "helios_staged_probe";
+
+            Rc<DxvkBuffer> readback = m_device->createBuffer(readbackInfo,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+            if (srcImage != nullptr) {
+              copyImageToBuffer(readback, 0u,
+                lookupFormatInfo(srcImage->info().format)->elementSize, 0u,
+                srcImage->info().format, srcImage, subresource,
+                VkOffset3D { 0, 0, 0 }, srcImage->mipLevelExtent(0u));
+            } else {
+              copyBuffer(readback, 0u, srcBuffer, 0u, probeSize);
+            }
+
+            m_heliosStagedProbes.push_back({ image, readback, probeSize,
+              HeliosProbeHarvestTick, tick, mode });
+            m_heliosStagedProbesIssued += 1u;
+
+            Logger::info(str::format("HELIOS PROBE issued: resid=",
+              image->info().sharing.heliosResourceId,
+              " tick=", tick, " mode=", mode,
+              " ext=", image->info().extent.width, "x", image->info().extent.height,
+              " memType=", image->info().sharing.heliosMemoryTypeIndex,
+              " size=", probeSize));
+          } catch (const DxvkError& e) {
+            Logger::warn(str::format("HELIOS PROBE issue failed: ", e.message()));
+          }
+        };
+
+        // The private-image readback is recorded AFTER this list's refresh
+        // copy above, so it observes the post-copy bytes.
+        issueProbe("private-detile", nullptr, image);
+
+        if (stagingImage != nullptr)
+          issueProbe("alias-detile", nullptr, stagingImage);
+        else
+          issueProbe("buffer-raw", staging, nullptr);
+      }
+
+      ++entry;
     }
 
-    m_heliosStagedRefresh.clear();
+    // Harvest matured probes: map the readback buffer and characterize the
+    // blob's raw bytes. ZERO (or alpha-only 0xFF at every 4th byte would still
+    // count as nonzero) => the creator's render never reached the shared blob
+    // (write/export/sync bug). NONZERO with structure => content is present and
+    // the remaining problem is read-side (tiling/encoding), since the same
+    // bytes copied at the surface's pitch still composite black.
+    for (auto it = m_heliosStagedProbes.begin(); it != m_heliosStagedProbes.end(); ) {
+      if (--it->countdown != 0u) {
+        ++it;
+        continue;
+      }
+
+      const uint8_t* data = reinterpret_cast<const uint8_t*>(it->buffer->mapPtr(0));
+
+      if (data == nullptr) {
+        Logger::warn("HELIOS PROBE: readback buffer has no CPU mapping");
+        it = m_heliosStagedProbes.erase(it);
+        continue;
+      }
+
+      size_t size = size_t(it->size);
+      size_t nonzero = 0u, bytesFF = 0u;
+      size_t firstNonzero = size, lastNonzero = 0u;
+      size_t quarterNonzero[4] = { };
+      uint32_t xorFold = 0u;
+
+      for (size_t i = 0u; i < size; i++) {
+        uint8_t b = data[i];
+
+        if (b != 0u) {
+          nonzero += 1u;
+          quarterNonzero[(i * 4u) / size] += 1u;
+
+          if (firstNonzero == size)
+            firstNonzero = i;
+
+          lastNonzero = i;
+
+          if (b == 0xFFu)
+            bytesFF += 1u;
+
+          xorFold ^= uint32_t(b) << ((i & 3u) * 8u);
+        }
+      }
+
+      Logger::info(str::format("HELIOS PROBE result: resid=",
+        it->image->info().sharing.heliosResourceId,
+        " tick=", it->issueTick,
+        " mode=", it->mode,
+        " ext=", it->image->info().extent.width, "x", it->image->info().extent.height,
+        " size=", size,
+        " nonzero=", nonzero, " (", (nonzero * 100u) / std::max<size_t>(size, 1u), "%)",
+        " bytesFF=", bytesFF,
+        " firstNZ=", (firstNonzero == size ? int64_t(-1) : int64_t(firstNonzero)),
+        " lastNZ=", (nonzero ? int64_t(lastNonzero) : int64_t(-1)),
+        " quarters=", quarterNonzero[0], "/", quarterNonzero[1],
+        "/", quarterNonzero[2], "/", quarterNonzero[3],
+        " xor32=0x", std::hex, xorFold, std::dec));
+
+      it = m_heliosStagedProbes.erase(it);
+    }
   }
 
 
@@ -9668,12 +9839,24 @@ namespace dxvk {
 
     m_sharedImagesTouched.clear();
 
-    // Helios GDI staging: carry the staged images sampled this list forward so
-    // the next list refreshes them (buffer->image copy) before sampling again.
-    // m_heliosStagedRefresh was cleared at this list's start by
-    // refreshHeliosStagedImages(), and m_heliosStagedTouched is already deduped.
-    for (auto& image : m_heliosStagedTouched)
-      m_heliosStagedRefresh.push_back(std::move(image));
+    // Helios GDI staging: merge the staged images sampled this list into the
+    // PERSISTENT refresh set (reset idle age if already enrolled). Every
+    // subsequent list start refreshes them until they go idle, so a same-list
+    // sample can never read pre-update bytes (see dxvk_context.h).
+    for (auto& image : m_heliosStagedTouched) {
+      bool found = false;
+
+      for (auto& entry : m_heliosStagedRefresh) {
+        if (entry.image == image) {
+          entry.idleTicks = 0u;
+          found = true;
+          break;
+        }
+      }
+
+      if (!found)
+        m_heliosStagedRefresh.push_back({ std::move(image), 0u });
+    }
 
     m_heliosStagedTouched.clear();
   }
@@ -10035,8 +10218,23 @@ namespace dxvk {
     // and UAV writes regardless of whether the image ever leaves its default
     // (GENERAL) layout — layout-transition tracking alone misses producers
     // that render entirely in GENERAL.
-    if (unlikely(image.info().shared) && !image.isHeliosGdiStaged()
-     && ((srcAccess & vk::AccessWriteMask) || srcLayout != dstLayout))
+    //
+    // Helios consumer-side QFOT acquire (13th-session black-desktop fix): a pure
+    // READER of an IMPORTED shared image (dwm sampling firefox/wallpaper/icons —
+    // device-local mem_type=1, not GDI-staged) previously enrolled nothing, so it
+    // never emitted the matching EXTERNAL->graphics acquire for the producer's
+    // release. On NVIDIA an EXCLUSIVE image released to VK_QUEUE_FAMILY_EXTERNAL
+    // has UNDEFINED contents for the consumer until it acquires it back — so the
+    // composited surface samples black/garbage. Enrolling imported images on READ
+    // makes them participate in the release(graphics->EXTERNAL)/acquire(EXTERNAL->
+    // graphics) cycle: the acquire at the next list start makes the producer's
+    // externally-released writes visible. The host-visible staged path is excluded
+    // (its per-frame copy already carries content); Export-mode producers are
+    // already handled by the write condition above.
+    bool heliosImportRead = image.info().sharing.mode == DxvkSharedHandleMode::Import
+      && (srcAccess & vk::AccessReadMask);
+    if (unlikely(image.info().shared) && !image.isHeliosGdiStaged() && !image.isHeliosDebugMagenta()
+     && ((srcAccess & vk::AccessWriteMask) || srcLayout != dstLayout || heliosImportRead))
       trackSharedImageTouched(image);
 
     // Helios GDI staging: a sampler read of a staged image arms it for a
@@ -10134,7 +10332,11 @@ namespace dxvk {
     // Helios: see the matching hook in accessImage — region writes to shared
     // images (e.g. UpdateSubresource copies) also need the external release,
     // except GDI-staged images (private device-local; never QFOT'd to EXTERNAL).
-    if (unlikely(image.info().shared) && !image.isHeliosGdiStaged() && (srcAccess & vk::AccessWriteMask))
+    // The consumer-side QFOT acquire (imported shared image, read) applies here too.
+    bool heliosImportReadRegion = image.info().sharing.mode == DxvkSharedHandleMode::Import
+      && (srcAccess & vk::AccessReadMask);
+    if (unlikely(image.info().shared) && !image.isHeliosGdiStaged() && !image.isHeliosDebugMagenta()
+     && ((srcAccess & vk::AccessWriteMask) || heliosImportReadRegion))
       trackSharedImageTouched(image);
 
     if (unlikely(image.isHeliosGdiStaged()) && (srcAccess & vk::AccessReadMask))

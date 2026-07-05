@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_map>
+
 #include "dxvk_barrier.h"
 #include "dxvk_bind_mask.h"
 #include "dxvk_cmdlist.h"
@@ -1398,13 +1400,42 @@ namespace dxvk {
     std::vector<Rc<DxvkImage>> m_sharedImagesTouched;
     std::vector<Rc<DxvkImage>> m_sharedImagesReleased;
 
-    /* Helios GDI staging (approach A): staged shared images sampled in the
-     * current command list, and the set to refresh (buffer->image copy) at the
-     * next command-list start so the sampler sees fresh executor bytes. Reads
-     * enroll into "touched"; end-of-list moves it to "refresh"; the next
-     * acquireSharedImagesFromExternal() copies then clears it. */
-    std::vector<Rc<DxvkImage>> m_heliosStagedTouched;
-    std::vector<Rc<DxvkImage>> m_heliosStagedRefresh;
+    /* Helios GDI staging: staged shared images sampled in the current command
+     * list enroll into "touched"; end-of-list merges them into the PERSISTENT
+     * refresh set, which is copied (source -> private image) at EVERY list
+     * start until the surface goes idle. Persistence is load-bearing: with the
+     * old touch->refresh-next-list-only model, any surface whose content
+     * changed once and was then re-read exactly once (wallpaper, sidebars,
+     * icons — one-shot draws) sampled the PRE-change bytes forever, and
+     * dropped arms caused multi-second stale ghosts in the IDD capture. */
+    struct HeliosStagedEntry {
+      Rc<DxvkImage> image;
+      uint32_t      idleTicks = 0u;
+    };
+    std::vector<Rc<DxvkImage>>     m_heliosStagedTouched;
+    std::vector<HeliosStagedEntry> m_heliosStagedRefresh;
+
+    /* Helios STEP-0 present-vs-absent probe (diagnostic, one-shot per staged
+     * image): a GPU copy of the imported venus staging buffer into a
+     * host-visible readback buffer, harvested (mapped + byte-analyzed + logged)
+     * a fixed number of refresh cycles after the copy was recorded, by which
+     * time the submission has long since executed. Answers whether the shared
+     * blob dwm imports actually contains the creator's bytes (nonzero) or is
+     * empty (zero -> the creator's render never reaches the shared blob). */
+    struct HeliosStagedProbe {
+      Rc<DxvkImage>  image;
+      Rc<DxvkBuffer> buffer;
+      VkDeviceSize   size      = 0u;
+      uint32_t       countdown = 0u;
+      uint32_t       issueTick = 0u;
+      const char*    mode      = "";
+    };
+    std::vector<HeliosStagedProbe>            m_heliosStagedProbes;
+    // Keyed by venus res_id (unique per session), NOT image pointer — image
+    // pointers are recycled by the allocator, which would carry a stale tick
+    // count onto a fresh surface.
+    std::unordered_map<uint32_t, uint32_t>    m_heliosStagedProbeTicks;
+    uint32_t                                  m_heliosStagedProbesIssued = 0u;
 
     DxvkDescriptorCopyWorker m_descriptorWorker;
 

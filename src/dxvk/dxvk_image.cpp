@@ -21,6 +21,24 @@ namespace dxvk {
       const char* value = std::getenv("HELIOS_DXVK_KMT_SHARED");
       return value && value[0] == '1' && value[1] == '\0';
     }
+
+    // Helios black-desktop localization diagnostic (13th session): when set,
+    // device-local cross-process shared IMPORTS are replaced by a PRIVATE
+    // device-local image cleared to solid magenta (see dxvk_image.cpp import
+    // path + d3d11_initializer InitHeliosMagentaTexture).
+    bool heliosDebugMagenta() {
+      const char* value = std::getenv("HELIOS_DEBUG_MAGENTA");
+      return value && value[0] == '1' && value[1] == '\0';
+    }
+
+    // Helios present-vs-absent probe (13th session): route DEVICE-LOCAL shared
+    // imports through the host-visible buffer-staging path (raw-byte buffer read +
+    // copyBufferToImage) so we can see whether the shared memory holds the
+    // creator's pixels (scrambled/tiled = present) or is empty (black = absent).
+    bool heliosDevlocalStaging() {
+      const char* value = std::getenv("HELIOS_DEVLOCAL_STAGING");
+      return value && value[0] == '1' && value[1] == '\0';
+    }
   }
   
   DxvkKeyedMutex::DxvkKeyedMutex(
@@ -159,6 +177,7 @@ namespace dxvk {
     m_properties    (memFlags),
     m_shaderStages  (util::shaderStages(createInfo.stages)),
     m_info          (createInfo) {
+    m_heliosDevice = device;
     m_allocator->registerResource(this);
 
     copyFormatList(createInfo.viewFormatCount, createInfo.viewFormats);
@@ -203,7 +222,7 @@ namespace dxvk {
     // UNDEFINED at the composition draw (VUID-vkCmdDraw-None-09600) and NVIDIA
     // loses the device. Tracking the real layout makes every transition (the
     // init/refresh copy AND dwm's sample) correct.
-    if (m_heliosGdiStaged)
+    if (m_heliosGdiStaged || m_heliosDebugMagenta)
       m_globalLayout = m_info.initialLayout;
 
     // Helios: createImageResource returns null (rather than throwing) when the
@@ -216,6 +235,35 @@ namespace dxvk {
     if (m_storage == nullptr) {
       m_allocator->unregisterResource(this);
       throw DxvkError("DxvkImage: failed to allocate backing storage");
+    }
+
+    // Helios diagnostic (black-desktop critique, 13th session): dump the full
+    // Vulkan image create-info for every SHARED surface so a cross-process
+    // creator<->opener VkImageCreateInfo mismatch can be diffed by resid/geometry.
+    // The device-local shared-import path (firefox/wallpaper/icons, mem_type=1)
+    // samples black; the leading mechanism is that the opener rebuilds a plain
+    // RTV|SRV texture from a lossy meta trailer that omits usage / MUTABLE_FORMAT /
+    // viewFormatList / tiling, so NVIDIA decodes the aliased OPAQUE_FD memory with
+    // a different layout/compression than the creator's swapchain backbuffer.
+    // Correlate an EXPORT line (creator) with an IMPORT line (opener) by resid
+    // (same global res_id) or by ext/fmt/allocSize.
+    if (m_info.sharing.mode != DxvkSharedHandleMode::None) {
+      const char* modeStr =
+        m_info.sharing.mode == DxvkSharedHandleMode::Import ? "IMPORT" :
+        m_info.sharing.mode == DxvkSharedHandleMode::Export ? "EXPORT" : "NONE";
+      Logger::info(str::format("DxvkImage: SHARED create-info mode=", modeStr,
+        " resid=", m_info.sharing.heliosResourceId,
+        " ext=", m_info.extent.width, "x", m_info.extent.height,
+        " fmt=", uint32_t(m_info.format),
+        " tiling=", uint32_t(m_info.tiling),
+        " mips=", m_info.mipLevels, " layers=", m_info.numLayers,
+        " viewFmts=", m_info.viewFormatCount,
+        " allocSize=", m_info.sharing.heliosAllocSize,
+        " memType=", m_info.sharing.heliosMemoryTypeIndex,
+        " staged=", (m_heliosGdiStaged ? 1u : 0u),
+        " alias=", (m_info.heliosDirectImportAlias ? 1u : 0u),
+        " usage=0x", std::hex, uint32_t(m_info.usage),
+        " flags=0x", uint32_t(m_info.flags), std::dec));
     }
   }
 
@@ -397,7 +445,8 @@ namespace dxvk {
     // single mip/layer/sample, 4-byte-per-texel (BGRA-class) host-visible
     // imports, because the executor always writes 4 bytes/texel at a
     // round_up(width*4,256) byte stride.
-    if (useHeliosRendererExternalMemory
+    const bool heliosImportCandidate = useHeliosRendererExternalMemory
+     && !m_info.heliosDirectImportAlias
      && m_info.sharing.mode == DxvkSharedHandleMode::Import
      && m_info.sharing.heliosResourceId
      && m_info.sharing.heliosAllocSize
@@ -405,8 +454,14 @@ namespace dxvk {
      && m_info.mipLevels == 1u
      && m_info.numLayers == 1u
      && m_info.sampleCount == VK_SAMPLE_COUNT_1_BIT
-     && lookupFormatInfo(m_info.format)->elementSize == 4u
-     && m_allocator->isHostVisibleMemoryType(m_info.sharing.heliosMemoryTypeIndex)) {
+     && m_heliosStagingBuffer == nullptr
+     && m_heliosStagingImage == nullptr;
+
+    const bool heliosHostVisibleImport = heliosImportCandidate
+     && m_allocator->isHostVisibleMemoryType(m_info.sharing.heliosMemoryTypeIndex);
+
+    if (heliosHostVisibleImport
+     && lookupFormatInfo(m_info.format)->elementSize == 4u) {
       // Best-effort: ANY failure here — importVenusStagingBuffer returning null
       // OR throwing — must fall through to the direct host-visible import path
       // below, never fail this texture's creation. A failed OpenSharedResource
@@ -437,6 +492,13 @@ namespace dxvk {
           m_heliosGdiStaged = true;
           useHeliosRendererExternalMemory = false;
 
+          // Source row-pitch alignment for the per-frame copyBufferToImage: the
+          // host-visible GDI executor writes LINEAR rows at round_up(width*4,256).
+          // (This buffer path is host-visible-only now — device-local blobs hold
+          // the host driver's OPTIMAL tiled layout, which no linear pitch can
+          // decode; they take the alias-image path below instead.)
+          m_heliosStagedRowAlign = 256u;
+
           Logger::info(str::format("DxvkImage: GDI staging enabled (", m_info.extent.width,
             "x", m_info.extent.height, ", resid ", m_info.sharing.heliosResourceId, ")"));
         } else {
@@ -449,6 +511,75 @@ namespace dxvk {
         m_heliosStagingBuffer = nullptr;
         m_heliosGdiStaged = false;
       }
+    } else if (heliosImportCandidate
+            && !heliosHostVisibleImport
+            && heliosDevlocalStaging()
+            && lookupFormatInfo(m_info.format)->aspectMask == VK_IMAGE_ASPECT_COLOR_BIT) {
+      // Device-local staging v2 (alias-image copy). The STEP-0 probes proved the
+      // shared blob CONTAINS the creator's pixels, but in the host driver's
+      // OPTIMAL (tiled) layout — a linear buffer copy at ANY pitch scrambles it
+      // (there is no pitch). The only correct GPU-side read is through an IMAGE
+      // bound to the same memory with the creator's create-info: create a
+      // direct-bind alias image of the imported venus resource and source the
+      // per-frame refresh from vkCmdCopyImage(alias -> private sampled image),
+      // which detiles in hardware. Transfer reads of direct imports are the
+      // historically-working path (the IDD's CopyResource capture delivered the
+      // taskbar for months); it is dwm's SAMPLED reads of direct imports that
+      // come up black. Any color format qualifies (A8 text masks included —
+      // image copies are pitch-free).
+      try {
+        DxvkImageCreateInfo aliasInfo = m_info;
+        aliasInfo.heliosDirectImportAlias = VK_TRUE;
+        aliasInfo.usage  |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        aliasInfo.stages |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+        aliasInfo.access |= VK_ACCESS_TRANSFER_READ_BIT;
+        // initialLayout stays UNDEFINED: VkImageCreateInfo.initialLayout must be
+        // UNDEFINED/PREINITIALIZED (VUID 00993; external-memory images require
+        // UNDEFINED, VUID 01443 — overriding it to GENERAL here tripped host
+        // validation and undefined NVIDIA behavior). Content is NOT discarded:
+        // Import-mode images track m_globalLayout = info().layout (GENERAL), so
+        // dxvk never emits an UNDEFINED->X discard transition on the alias.
+        aliasInfo.debugName = "helios_devlocal_alias";
+
+        Rc<DxvkImage> alias = new DxvkImage(m_heliosDevice, aliasInfo,
+          *m_allocator, m_properties);
+
+        // All fallible steps done — commit. The sampled image becomes a private
+        // device-local surface (no venus import of its own).
+        m_heliosStagingImage = std::move(alias);
+        m_heliosGdiStaged = true;
+        useHeliosRendererExternalMemory = false;
+
+        Logger::info(str::format("DxvkImage: device-local ALIAS staging enabled (",
+          m_info.extent.width, "x", m_info.extent.height,
+          ", resid ", m_info.sharing.heliosResourceId, ")"));
+      } catch (const DxvkError& e) {
+        Logger::warn(str::format("DxvkImage: device-local alias staging setup failed, "
+          "falling back to direct import: ", e.message()));
+        m_heliosStagingImage = nullptr;
+        m_heliosGdiStaged = false;
+      }
+    }
+
+    // Helios magenta LOCALIZATION diagnostic (13th session): when HELIOS_DEBUG_MAGENTA
+    // is set, take the DEVICE-LOCAL cross-process shared import (firefox/wallpaper/icons —
+    // the black surfaces that fell through the host-visible staging gate above) and make it
+    // a PRIVATE device-local image cleared to solid MAGENTA (see InitHeliosMagentaTexture)
+    // instead of importing the creator's memory. If dwm then shows magenta where the desktop
+    // was black, dwm samples the exact image we hand it and the sample/compose/IDD chain is
+    // intact => the black is a content-DELIVERY bug (the import does not carry the creator's
+    // pixels). If still black, dwm samples a different surface. Device-local imports only
+    // (host-visible ones already took the working staging path above).
+    if (useHeliosRendererExternalMemory
+     && m_info.sharing.mode == DxvkSharedHandleMode::Import
+     && m_info.sharing.heliosResourceId
+     && !m_heliosGdiStaged
+     && !m_info.heliosDirectImportAlias
+     && heliosDebugMagenta()) {
+      m_heliosDebugMagenta = true;
+      useHeliosRendererExternalMemory = false;  // private device-local; no venus import
+      Logger::info(str::format("DxvkImage: DEBUG MAGENTA private image (", m_info.extent.width,
+        "x", m_info.extent.height, ", resid ", m_info.sharing.heliosResourceId, ")"));
     }
 
     // Set up external memory parameters for shared images

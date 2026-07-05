@@ -77,6 +77,12 @@ namespace dxvk {
     // Shared handle info
     DxvkSharedHandleInfo sharing = { };
 
+    // Helios: this image is an internal direct-bind alias of an imported venus
+    // resource, created as the transfer-read source for a staged shared image.
+    // Skips the staging/magenta gates so the import binds the venus memory
+    // directly (recursion guard).
+    VkBool32 heliosDirectImportAlias = VK_FALSE;
+
     // Debug name
     const char* debugName = nullptr;
   };
@@ -875,11 +881,46 @@ namespace dxvk {
     }
 
     /**
+     * \brief Row-pitch byte alignment of the staged surface's source blob
+     *
+     * The host-visible GDI executor writes at round_up(width*4,256); device-local
+     * venus blobs are stored TIGHT (width*4). The per-frame copyBufferToImage must
+     * use the matching alignment or the read shears / overruns the buffer.
+     */
+    uint32_t heliosStagedRowAlign() const {
+      return m_heliosStagedRowAlign;
+    }
+
+    /**
      * \brief Backing venus host-visible staging buffer, if GDI-staged
      * \returns The staging buffer, or null
      */
     const Rc<DxvkBuffer>& heliosStagingBuffer() const {
       return m_heliosStagingBuffer;
+    }
+
+    /**
+     * \brief Direct-bind alias image of the imported venus resource
+     *
+     * Device-local staging v2: the shared blob holds the host driver's OPTIMAL
+     * (tiled) layout, so no linear buffer copy at any pitch can decode it. The
+     * alias image binds the imported memory directly with the creator's
+     * create-info; the per-frame refresh does vkCmdCopyImage(alias -> private
+     * sampled image), which reads through the tiling correctly.
+     * \returns The alias image, or null (buffer-staged or unstaged)
+     */
+    const Rc<DxvkImage>& heliosStagingImage() const {
+      return m_heliosStagingImage;
+    }
+
+    /**
+     * \brief Whether this is a Helios debug-magenta private image
+     *
+     * Localization diagnostic (HELIOS_DEBUG_MAGENTA): a device-local shared
+     * import replaced by a private device-local image cleared to solid magenta.
+     */
+    bool isHeliosDebugMagenta() const {
+      return m_heliosDebugMagenta;
     }
 
   private:
@@ -899,6 +940,20 @@ namespace dxvk {
     // creator's host-visible venus bytes to be copied in per frame.
     bool                        m_heliosGdiStaged = false;
     Rc<DxvkBuffer>              m_heliosStagingBuffer = nullptr;
+    // Device-local staging v2: direct-bind alias image of the imported venus
+    // resource; per-frame vkCmdCopyImage(alias -> private image) detiles the
+    // creator's OPTIMAL layout (a linear buffer copy cannot).
+    Rc<DxvkImage>               m_heliosStagingImage = nullptr;
+    // Device pointer for constructing the internal alias image during
+    // allocateStorageWithUsage (only Helios uses this).
+    DxvkDevice*                 m_heliosDevice = nullptr;
+    // Source-blob row-pitch alignment: 256 for the host-visible GDI executor,
+    // element-size (tight) for device-local venus blobs.
+    uint32_t                    m_heliosStagedRowAlign = 256u;
+
+    // Helios localization diagnostic: private device-local image cleared to
+    // magenta in place of a device-local cross-process shared import.
+    bool                        m_heliosDebugMagenta = false;
 
     bool                        m_unifiedLayoutEnabled = false;
     bool                        m_unifiedLayoutAvailable = false;

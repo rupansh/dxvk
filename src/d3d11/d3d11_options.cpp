@@ -28,7 +28,19 @@ namespace dxvk {
     this->maxFrameLatency       = config.getOption<int32_t>("dxgi.maxFrameLatency", 0);
     this->exposeDriverCommandLists = config.getOption<bool>("d3d11.exposeDriverCommandLists", true);
     this->reproducibleCommandStream = config.getOption<bool>("d3d11.reproducibleCommandStream", false);
-    this->disableDirectImageMapping = config.getOption<bool>("d3d11.disableDirectImageMapping", false);
+    // Helios: direct image mapping is structurally illegal on the venus
+    // bridge. DIRECT-mapped images are LINEAR host-visible with
+    // initialLayout=PREINITIALIZED; PREINITIALIZED images cannot carry
+    // VkExternalMemoryImageCreateInfo (VUID-VkImageCreateInfo-pNext-01443),
+    // but vkr force-exports all host-visible memory, so the bind violates
+    // VUID-VkBindImageMemoryInfo-memory-02728 — UB the host NVIDIA driver
+    // punishes by dropping the bind: CPU writes land in unbound pages and the
+    // GPU reads zeros. Proven by tools/d3d11_upload_integrity_probe.cpp
+    // (dynamic 1896x1030 upload read back 100% zero) — the mechanism behind
+    // dwm's black wallpaper / solid-color / mica brush surfaces. Force every
+    // mappable image through the buffer-backed paths (which carry the
+    // matching handleTypes fix in vn_buffer.c).
+    this->disableDirectImageMapping = config.getOption<bool>("d3d11.disableDirectImageMapping", true);
 
     // Clamp LOD bias so that people don't abuse this in unintended ways
     this->samplerLodBias = dxvk::fclamp(this->samplerLodBias, -2.0f, 1.0f);
