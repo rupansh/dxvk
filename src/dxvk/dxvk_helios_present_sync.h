@@ -8,8 +8,10 @@ namespace dxvk {
    * \brief Helios cross-process present-ordering publication (WS1 #4)
    *
    * A producer (dwm's D3D11 device) publishes, per presented venus resource
-   * id, the (producer pid, timeline value) pair whose named present fence
-   * (\c Global\HeliosPresentFence_<pid>, a WDDM monitored fence signaled by
+   * id, the (producer pid, fence id, timeline value) triple whose named
+   * present fence (\c Global\HeliosPresentFence_<pid>_<fenceId> — the fence
+   * id disambiguates multiple D3D11 devices in one producer process, dwm
+   * creates several — a WDDM monitored fence signaled by
    * the producer ICD's retire thread at HOST GPU completion) reaches
    * \c value once every submission the presented frame depends on has
    * completed. A consumer (the IddCx copy path running on this same engine
@@ -34,13 +36,13 @@ namespace dxvk {
      * or full.
      * \returns \c false when the slot could not be written
      */
-    static bool publish(uint32_t resid, uint32_t pid, uint64_t value);
+    static bool publish(uint32_t resid, uint32_t pid, uint32_t fenceId, uint64_t value);
 
     /**
      * \brief Looks up the latest published (pid, value) for a resource id
      * \returns \c false when no slot exists for \c resid
      */
-    static bool lookup(uint32_t resid, uint32_t* pid, uint64_t* value);
+    static bool lookup(uint32_t resid, uint32_t* pid, uint32_t* fenceId, uint64_t* value);
 
   };
 
