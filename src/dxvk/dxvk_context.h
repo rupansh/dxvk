@@ -1449,6 +1449,11 @@ namespace dxvk {
     uint64_t                                  m_heliosPresentWaits        = 0u;
     uint64_t                                  m_heliosPresentWaitUsTotal  = 0u;
     uint64_t                                  m_heliosPresentWaitTimeouts = 0u;
+    /* imported-source reads that found NO publish slot (unordered read —
+     * the silent path that hid the drag-trail root cause) and reads whose
+     * target value had already retired (no wait needed) */
+    uint64_t                                  m_heliosPresentWaitNoSlot   = 0u;
+    uint64_t                                  m_heliosPresentWaitFast     = 0u;
 
     DxvkDescriptorCopyWorker m_descriptorWorker;
 

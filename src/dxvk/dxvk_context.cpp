@@ -504,6 +504,18 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            extent) {
+    // Helios consumer-side ordering AT COPY TIME: the list-start wait in
+    // refreshHeliosStagedImages re-reads the publish slot when the list
+    // BEGAN, which can predate the IddCx acquire this copy serves by a full
+    // consumer cycle — the wait then targets an old value, "succeeds", and
+    // the copy reads ring-stale content inside freshly-reported damage
+    // rects (the drag-trail ghosting, root-caused 2026-07-06). Here the
+    // acquire has already happened and the source buffer cannot be
+    // re-presented while the consumer holds it, so the slot value IS the
+    // acquired present's value — the exact wait target. No-op for
+    // non-imported sources and when the config disables the wait.
+    heliosPresentWaitBeforeRefresh(srcImage);
+
     if (this->copyImageClear(dstImage, dstSubresource, dstOffset, extent, srcImage, srcSubresource)
      || this->copyImageInline(*dstImage, dstSubresource, dstOffset, *srcImage, srcSubresource, srcOffset, extent))
       return;
@@ -611,6 +623,11 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            srcExtent) {
+    // Helios consumer-side ordering at copy time — see copyImage. The IddCx
+    // consumer's CopyResource into a STAGING texture lands here when dxvk
+    // backs the staging resource with a buffer.
+    heliosPresentWaitBeforeRefresh(srcImage);
+
     bool useFb = !formatsAreBufferCopyCompatible(srcImage->info().format, dstFormat);
 
     if (useFb) {
@@ -9424,8 +9441,17 @@ namespace dxvk {
     uint32_t fenceId = 0u;
     uint64_t value = 0u;
 
-    if (!resid || !HeliosPresentSync::lookup(resid, &pid, &fenceId, &value))
+    if (!resid || !HeliosPresentSync::lookup(resid, &pid, &fenceId, &value)) {
+      // No publish slot = an UNORDERED read of an imported surface. Counted
+      // loudly: this silent return is exactly what hid the drag-trail root
+      // cause (2026-07-06).
+      m_heliosPresentWaitNoSlot += 1u;
+      if ((m_heliosPresentWaitNoSlot % 512u) == 1u) {
+        Logger::info(str::format("present-wait: unordered imported reads (no slot): ",
+          m_heliosPresentWaitNoSlot, " (resid ", resid, ")"));
+      }
       return;
+    }
 
     // Keyed by (pid, fenceId): one producer process owns several D3D11
     // devices, each with its own named fence; a recreated device in the
@@ -9465,8 +9491,10 @@ namespace dxvk {
       }
     }
 
-    if (entry.fence->getValue() >= value)
+    if (entry.fence->getValue() >= value) {
+      m_heliosPresentWaitFast += 1u;
       return;
+    }
 
     const auto t0 = dxvk::high_resolution_clock::now();
     const VkResult vr = entry.fence->waitBounded(value, uint64_t(waitUs) * 1000u);
@@ -9491,7 +9519,9 @@ namespace dxvk {
     if ((m_heliosPresentWaits % 128u) == 0u) {
       Logger::info(str::format("present-wait: waits=", m_heliosPresentWaits,
         " avg_us=", m_heliosPresentWaitUsTotal / m_heliosPresentWaits,
-        " timeouts=", m_heliosPresentWaitTimeouts));
+        " timeouts=", m_heliosPresentWaitTimeouts,
+        " fast=", m_heliosPresentWaitFast,
+        " noslot=", m_heliosPresentWaitNoSlot));
     }
   }
 
