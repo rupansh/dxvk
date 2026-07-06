@@ -9610,6 +9610,17 @@ namespace dxvk {
       // (post-copy — the exact bytes the consumer samples). Diverging results
       // between the two isolate the copy; a full private image under a black
       // screen isolates composition/capture downstream of us.
+      //
+      // DIAGNOSTIC ONLY, config-gated (dxvk.heliosStagedProbes, default OFF):
+      // this machinery was the recurring ~1.5 s pipeline stall (2026-07-06,
+      // QMP fence-trace root cause) — the harvest scan below ran on the CS
+      // thread against the WC venus mapping while the IddCx frame was held,
+      // starving every producer in the guest for 3×~1.5 s every 600 frames.
+      if (!m_device->config().heliosStagedProbes) {
+        ++entry;
+        continue;
+      }
+
       uint32_t tick = ++m_heliosStagedProbeTicks[image->info().sharing.heliosResourceId];
 
       if ((tick == HeliosProbeIssueTickA || tick == HeliosProbeIssueTickB
@@ -9690,15 +9701,23 @@ namespace dxvk {
         continue;
       }
 
-      const uint8_t* data = reinterpret_cast<const uint8_t*>(it->buffer->mapPtr(0));
+      const uint8_t* mapped = reinterpret_cast<const uint8_t*>(it->buffer->mapPtr(0));
 
-      if (data == nullptr) {
+      if (mapped == nullptr) {
         Logger::warn("HELIOS PROBE: readback buffer has no CPU mapping");
         it = m_heliosStagedProbes.erase(it);
         continue;
       }
 
       size_t size = size_t(it->size);
+
+      // The venus readback mapping is WC — never scan it element-wise
+      // (single-byte uncached reads are ~5 MB/s; this exact loop over the
+      // raw mapping was the ~1.5 s CS-thread stall). Bulk-copy to cacheable
+      // memory once, then characterize at memory speed.
+      std::vector<uint8_t> host(size);
+      std::memcpy(host.data(), mapped, size);
+      const uint8_t* data = host.data();
       size_t nonzero = 0u, bytesFF = 0u;
       size_t firstNonzero = size, lastNonzero = 0u;
       size_t quarterNonzero[4] = { };

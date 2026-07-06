@@ -63,6 +63,17 @@ namespace dxvk {
     /// imports that actually publish (dwm/IDD paths, not game textures).
     int32_t heliosPresentWaitUs = 32000;
 
+    /// Helios staged-surface content probes (bring-up diagnostics): at
+    /// fixed refresh ticks, read the full raw+post-copy surface back and
+    /// characterize the bytes. ROOT-CAUSED as the recurring ~1.5 s pipeline
+    /// stall (2026-07-06): the harvest scanned a ~7.8 MiB readback byte-wise
+    /// through the WC venus mapping ON THE CS THREAD (~0.75 s per probe, two
+    /// probes per staged image, every 600 refreshes), which held the IddCx
+    /// acquired frame and starved every producer behind it. Diagnostic
+    /// only — default OFF; enable per-process via DXVK_CONFIG for black-
+    /// surface triage.
+    bool heliosStagedProbes = false;
+
     /// Disable VK_NV_low_latency2. This extension
     /// appears to be all sorts of broken on 32-bit.
     Tristate disableNvLowLatency2 = Tristate::Auto;
