@@ -145,6 +145,24 @@ namespace dxvk {
             uint64_t              Value);
 
     /**
+     * \brief Helios: image-level copy for the dcomp present vehicle
+     *
+     * Records a full-subresource copyImage on the open command list, at the
+     * DXVK image level so the vehicle can source the LIVE storage of an
+     * imported frame (the direct-bind staging ALIAS for device-local
+     * imports) instead of the D3D11 texture's private image, which is only
+     * refreshed at command-list start when a prior read armed it — the COM
+     * CopySubresourceRegion path would read a stale (frame-1: undefined)
+     * private image. DxvkContext::copyImage fires the bounded copy-time
+     * consumer present-wait for Import-mode sources (6eab004c), which is
+     * exactly what orders this copy against the producing ICD's GPU writes.
+     */
+    void HeliosCopyExternalFrame(
+      const Rc<DxvkImage>&        DstImage,
+      const Rc<DxvkImage>&        SrcImage,
+            VkExtent3D            Extent);
+
+    /**
      * \brief Helios: inject a command ordered after all recorded work
      *
      * Dispatches the current recording chunk to the CS queue, then appends

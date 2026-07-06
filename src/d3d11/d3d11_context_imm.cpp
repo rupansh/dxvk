@@ -981,6 +981,27 @@ namespace dxvk {
   }
 
 
+  void D3D11ImmediateContext::HeliosCopyExternalFrame(
+    const Rc<DxvkImage>&        DstImage,
+    const Rc<DxvkImage>&        SrcImage,
+          VkExtent3D            Extent) {
+    D3D10DeviceLock lock = LockContext();
+
+    EmitCs([
+      cDstImage = DstImage,
+      cSrcImage = SrcImage,
+      cExtent   = Extent
+    ] (DxvkContext* ctx) {
+      const VkImageSubresourceLayers layers =
+        { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+      ctx->copyImage(
+        cDstImage, layers, VkOffset3D { 0, 0, 0 },
+        cSrcImage, layers, VkOffset3D { 0, 0, 0 },
+        cExtent);
+    });
+  }
+
+
   void D3D11ImmediateContext::InjectCsChunk(
           DxvkCsQueue                 Queue,
           DxvkCsChunkRef&&            Chunk,
