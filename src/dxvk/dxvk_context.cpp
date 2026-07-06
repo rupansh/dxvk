@@ -9577,14 +9577,6 @@ namespace dxvk {
         continue;
       }
 
-      // WS1 #4 consumer-side ordering: before recording this list's read of
-      // the imported surface, wait (bounded) until the producer's published
-      // present-fence value for this resid has retired at HOST GPU
-      // completion. Config-gated (heliosPresentWaitUs; on by default only in
-      // the WUDFHost/IddCx profile) and self-throttling: once a published
-      // value has signaled, re-checks are a single vkGetSemaphoreCounterValue.
-      heliosPresentWaitBeforeRefresh(image);
-
       VkImageSubresourceLayers subresource = { };
       subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
       subresource.mipLevel       = 0u;
@@ -9594,11 +9586,20 @@ namespace dxvk {
       if (stagingImage != nullptr) {
         // Device-local staging v2: image-to-image copy from the direct-bind
         // alias — the only read that correctly decodes the blob's OPTIMAL
-        // (tiled) layout.
+        // (tiled) layout. WS1 #4 consumer-side ordering comes from
+        // copyImage's own copy-execution-time wait on the alias (6eab004c —
+        // it re-reads the publish slot HERE, the freshest value); the old
+        // list-start wait this loop used to run first was a second bounded
+        // wait per surface per list targeting a staler value, adding
+        // latency and nothing else (removed 24th session).
         copyImage(image, subresource, VkOffset3D { 0, 0, 0 },
           stagingImage, subresource, VkOffset3D { 0, 0, 0 },
           image->mipLevelExtent(0u));
       } else {
+        // Host-visible staging v1: copyBufferToImage carries no consumer
+        // wait of its own (buffers have no sharing identity), so the
+        // list-start wait on the IMAGE stays the orderer for this variant.
+        heliosPresentWaitBeforeRefresh(image);
         copyBufferToImage(image, subresource,
           VkOffset3D { 0, 0, 0 }, image->mipLevelExtent(0u),
           staging, 0u, image->heliosStagedRowAlign(), 0u,
