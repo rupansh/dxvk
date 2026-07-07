@@ -262,4 +262,17 @@ namespace dxvk {
     return false;
   }
 
+
+  namespace {
+    volatile LONG64 g_gateFlushes = 0;
+  }
+
+  void HeliosPresentSync::noteGateFlush() {
+    ::InterlockedIncrement64(&g_gateFlushes);
+  }
+
+  uint64_t HeliosPresentSync::gateFlushCount() {
+    return uint64_t(::InterlockedCompareExchange64(&g_gateFlushes, 0, 0));
+  }
+
 }

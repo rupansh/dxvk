@@ -44,6 +44,21 @@ namespace dxvk {
      */
     static bool lookup(uint32_t resid, uint32_t* pid, uint32_t* fenceId, uint64_t* value);
 
+    /**
+     * \brief Counts a bind-time staleness-gate flush
+     *
+     * The d3d11 layer's HeliosGateStagedSrvFreshness flushes when a bound
+     * staged SRV's producer published past its last re-stage (27th-session
+     * fix). Uncounted, the consumer-side flush cost is invisible; the
+     * total is reported in the present-wait telemetry line.
+     */
+    static void noteGateFlush();
+
+    /**
+     * \brief Bind-time staleness-gate flushes so far (process-wide)
+     */
+    static uint64_t gateFlushCount();
+
   };
 
 }
