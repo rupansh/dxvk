@@ -959,6 +959,21 @@ namespace dxvk {
     }
 
     /**
+     * \brief Re-arms the staleness gate after a skipped re-stage
+     *
+     * A refresh that SKIPS an unretired kwait-ordered value leaves the
+     * staged copy behind that value; releasing the claim lets a later
+     * bind flush again for the same value, so the retry converges even
+     * when no newer publish ever arrives. No-op if a newer value has
+     * been claimed meanwhile.
+     */
+    void heliosReleaseFlushClaim(uint64_t value) {
+      uint64_t expected = value;
+      m_heliosFlushRequestedValue.compare_exchange_strong(expected, value - 1u,
+        std::memory_order_acq_rel, std::memory_order_relaxed);
+    }
+
+    /**
      * \brief Whether the D3D11 resource owning this staged image was destroyed
      *
      * The staged-refresh set holds an Rc on enrolled images; without this flag

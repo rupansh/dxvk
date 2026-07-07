@@ -16,6 +16,12 @@ namespace dxvk {
     constexpr uint32_t HpsMagic     = 0x31535048u; // 'HPS1'
     constexpr uint32_t HpsSlotCount = 64u;
 
+    // Bit 30 of the slot's fenceId = "this value's flip is kernel-held
+    // until the value retires" (kwait-ordered publish). Free in both fence
+    // id spaces: UMD ids are a tiny low counter, ICD ids 0x80000000|counter.
+    // Stripped by lookup(); the on-disk name is built from the real id.
+    constexpr uint32_t HpsFenceIdKwaitBit = 0x40000000u;
+
     struct HpsHeader {
       uint32_t magic;
       uint32_t slotCount;
@@ -203,7 +209,8 @@ namespace dxvk {
   }
 
 
-  bool HeliosPresentSync::publish(uint32_t resid, uint32_t pid, uint32_t fenceId, uint64_t value) {
+  bool HeliosPresentSync::publish(uint32_t resid, uint32_t pid, uint32_t fenceId, uint64_t value,
+      bool kwaitOrdered) {
     std::call_once(g_mapOnce, initMapping);
 
     if (!g_map.slots || !resid)
@@ -225,7 +232,7 @@ namespace dxvk {
     // there is no writer-writer race past the claim.
     ::InterlockedIncrement(&slot->seq);            // -> odd
     slot->pid = pid;
-    slot->fenceId = fenceId;
+    slot->fenceId = fenceId | (kwaitOrdered ? HpsFenceIdKwaitBit : 0u);
     slot->value = LONG64(value);
     slot->producerStart = selfStartTime();
     ::InterlockedIncrement(&slot->seq);            // -> even
@@ -233,7 +240,8 @@ namespace dxvk {
   }
 
 
-  bool HeliosPresentSync::lookup(uint32_t resid, uint32_t* pid, uint32_t* fenceId, uint64_t* value) {
+  bool HeliosPresentSync::lookup(uint32_t resid, uint32_t* pid, uint32_t* fenceId, uint64_t* value,
+      bool* kwaitOrdered) {
     std::call_once(g_mapOnce, initMapping);
 
     if (!g_map.slots || !resid)
@@ -254,8 +262,10 @@ namespace dxvk {
       if (seq0 != seq1 || slot->resid != resid)
         continue;
       *pid = p;
-      *fenceId = f;
+      *fenceId = f & ~HpsFenceIdKwaitBit;
       *value = v;
+      if (kwaitOrdered)
+        *kwaitOrdered = (f & HpsFenceIdKwaitBit) != 0u;
       return p != 0;
     }
 
