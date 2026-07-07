@@ -9564,6 +9564,16 @@ namespace dxvk {
     for (auto entry = m_heliosStagedRefresh.begin(); entry != m_heliosStagedRefresh.end(); ) {
       const auto& image = entry->image;
 
+      // Owning D3D11 resource destroyed: drop the enrollment immediately.
+      // Without this the dead producer's imports keep getting full-image
+      // refresh copies + failed slot lookups per list until the idle prune
+      // (observed live: three 500x500 zombie copies per list for ~60 s per
+      // dead vkcube chain), and the Rc here pins their venus resources.
+      if (image->isHeliosOrphaned()) {
+        entry = m_heliosStagedRefresh.erase(entry);
+        continue;
+      }
+
       if (++entry->idleTicks > HeliosStagedIdleLimit) {
         entry = m_heliosStagedRefresh.erase(entry);
         continue;
@@ -9604,6 +9614,19 @@ namespace dxvk {
           VkOffset3D { 0, 0, 0 }, image->mipLevelExtent(0u),
           staging, 0u, image->heliosStagedRowAlign(), 0u,
           image->info().format);
+      }
+
+      // Stamp the producer value this refresh observed: the bind-time
+      // staleness gate compares the live slot against this to decide
+      // whether a flush (hence a re-stage at the next list start) is needed
+      // before sampling. Consumer freshness must track producer progress,
+      // not command-list cadence — an idle process's chunks can span many
+      // frames (root cause of the frozen-frame alternation, 27th session).
+      if (const uint32_t resid = image->info().sharing.heliosResourceId) {
+        uint32_t slotPid = 0u, slotFenceId = 0u;
+        uint64_t slotValue = 0u;
+        if (HeliosPresentSync::lookup(resid, &slotPid, &slotFenceId, &slotValue))
+          image->setHeliosLastRefreshValue(slotValue);
       }
 
       // Content probes: at each probe tick, read back BOTH the raw source

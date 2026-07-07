@@ -32,7 +32,13 @@ namespace dxvk {
       uint32_t      pid;
       uint32_t      fenceId;
       volatile LONG64 value;
-      uint64_t      reserved2;
+      // Producer process CREATION TIME (FILETIME as u64): pid liveness alone
+      // is wrong for recycling — the table file persists across boots and
+      // Windows reuses pids, so a dead producer's slot can look alive
+      // forever (observed live: 64/64 slots full of stale claims). A pid
+      // whose current creation time differs from this stamp is a reused
+      // pid; legacy slots carry 0 here and are recycled on first pressure.
+      uint64_t      producerStart;
     };
 
     static_assert(sizeof(HpsHeader) == 32);
@@ -134,12 +140,37 @@ namespace dxvk {
       return nullptr;
     }
 
-    bool pidAlive(uint32_t pid) {
+    uint64_t selfStartTime() {
+      static const uint64_t s_start = [] {
+        FILETIME creation = { }, exit = { }, kernel = { }, user = { };
+        if (!::GetProcessTimes(::GetCurrentProcess(), &creation, &exit, &kernel, &user))
+          return uint64_t(0u);
+        return (uint64_t(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+      }();
+      return s_start;
+    }
+
+    // A slot's producer is alive iff its pid exists AND the process' creation
+    // time matches the stamp the producer wrote — anything else (dead pid,
+    // reused pid, legacy zero stamp) makes the slot recyclable. A shielded
+    // process (ACCESS_DENIED) is conservatively treated as alive.
+    bool producerAlive(const HpsSlot* slot) {
+      const uint32_t pid = slot->pid;
+      if (!pid)
+        return false;
       HANDLE proc = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
       if (!proc)
         return ::GetLastError() == ERROR_ACCESS_DENIED; // exists, just shielded
       DWORD code = 0;
-      const bool alive = ::GetExitCodeProcess(proc, &code) && code == STILL_ACTIVE;
+      bool alive = ::GetExitCodeProcess(proc, &code) && code == STILL_ACTIVE;
+      if (alive) {
+        FILETIME creation = { }, exit = { }, kernel = { }, user = { };
+        if (::GetProcessTimes(proc, &creation, &exit, &kernel, &user)) {
+          const uint64_t start =
+            (uint64_t(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+          alive = (start == slot->producerStart);
+        }
+      }
       ::CloseHandle(proc);
       return alive;
     }
@@ -158,9 +189,8 @@ namespace dxvk {
 
       for (uint32_t i = 0; i < HpsSlotCount; i++) {
         HpsSlot* slot = &g_map.slots[i];
-        const uint32_t pid = slot->pid;
         const uint32_t old = slot->resid;
-        if (old != 0 && pid != 0 && !pidAlive(pid)
+        if (old != 0 && !producerAlive(slot)
          && ::InterlockedCompareExchange(
               reinterpret_cast<volatile LONG*>(&slot->resid),
               LONG(resid), LONG(old)) == LONG(old))
@@ -197,6 +227,7 @@ namespace dxvk {
     slot->pid = pid;
     slot->fenceId = fenceId;
     slot->value = LONG64(value);
+    slot->producerStart = selfStartTime();
     ::InterlockedIncrement(&slot->seq);            // -> even
     return true;
   }
