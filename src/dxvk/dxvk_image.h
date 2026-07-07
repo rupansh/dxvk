@@ -923,6 +923,58 @@ namespace dxvk {
       return m_heliosDebugMagenta;
     }
 
+    /**
+     * \brief Producer present-sync value observed by the last staged refresh
+     *
+     * Stamped by refreshHeliosStagedImages when it re-stages this image; read
+     * at SRV-bind time to decide whether the producer has published a newer
+     * frame than the staged copy holds (bind-time staleness gate — consumer
+     * freshness must track producer progress, not command-list cadence).
+     */
+    uint64_t heliosLastRefreshValue() const {
+      return m_heliosLastRefreshValue.load(std::memory_order_acquire);
+    }
+
+    void setHeliosLastRefreshValue(uint64_t value) {
+      m_heliosLastRefreshValue.store(value, std::memory_order_release);
+    }
+
+    /**
+     * \brief Rate limit for the bind-time staleness gate
+     *
+     * The refresh stamp is written on the CS thread when the re-stage
+     * executes, so between the gate's flush and that execution the image
+     * still reads stale; recording the value a flush was already issued
+     * for bounds the gate to one flush per published producer value.
+     * \returns true if this call claimed the flush for \c value
+     */
+    bool heliosClaimFlushForValue(uint64_t value) {
+      uint64_t prev = m_heliosFlushRequestedValue.load(std::memory_order_relaxed);
+      while (prev < value) {
+        if (m_heliosFlushRequestedValue.compare_exchange_weak(prev, value,
+            std::memory_order_acq_rel, std::memory_order_relaxed))
+          return true;
+      }
+      return false;
+    }
+
+    /**
+     * \brief Whether the D3D11 resource owning this staged image was destroyed
+     *
+     * The staged-refresh set holds an Rc on enrolled images; without this flag
+     * a dead producer's imports would be zombie-refreshed (full-image copy +
+     * failed slot lookup per command list) until the idle prune, keeping the
+     * venus resources alive as well. Set by the texture destructor; the
+     * refresh loop erases flagged entries.
+     */
+    bool isHeliosOrphaned() const {
+      return m_heliosOrphaned.load(std::memory_order_acquire);
+    }
+
+    void setHeliosOrphaned() {
+      m_heliosOrphaned.store(true, std::memory_order_release);
+    }
+
   private:
 
     Rc<vk::DeviceFn>            m_vkd;
@@ -954,6 +1006,13 @@ namespace dxvk {
     // Helios localization diagnostic: private device-local image cleared to
     // magenta in place of a device-local cross-process shared import.
     bool                        m_heliosDebugMagenta = false;
+
+    // Present-sync value the last staged refresh observed (bind-time gate),
+    // the highest value a gate flush was already issued for (rate limit),
+    // and the owning-resource-destroyed flag (zombie-refresh unenroll).
+    std::atomic<uint64_t>       m_heliosLastRefreshValue = { 0u };
+    std::atomic<uint64_t>       m_heliosFlushRequestedValue = { 0u };
+    std::atomic<bool>           m_heliosOrphaned = { false };
 
     bool                        m_unifiedLayoutEnabled = false;
     bool                        m_unifiedLayoutAvailable = false;

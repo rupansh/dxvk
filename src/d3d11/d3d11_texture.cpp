@@ -316,7 +316,13 @@ namespace dxvk {
 
 
   D3D11CommonTexture::~D3D11CommonTexture() {
-    
+    // Helios: unenroll from the staged-refresh set. The set holds an Rc on
+    // enrolled images, so without this a dead producer's imports get
+    // zombie-refreshed (full-image copy + failed slot lookup per command
+    // list) until the idle prune, pinning the venus resources alive too.
+    // The flag is checked (and the entry erased) on the CS thread.
+    if (m_image != nullptr && m_image->isHeliosGdiStaged())
+      m_image->setHeliosOrphaned();
   }
   
   
