@@ -9453,6 +9453,48 @@ namespace dxvk {
       return;
     }
 
+    DxvkFence* fence = heliosProducerFence(pid, fenceId);
+    if (fence == nullptr)
+      return;
+
+    if (fence->getValue() >= value) {
+      m_heliosPresentWaitFast += 1u;
+      return;
+    }
+
+    const auto t0 = dxvk::high_resolution_clock::now();
+    const VkResult vr = fence->waitBounded(value, uint64_t(waitUs) * 1000u);
+    const auto t1 = dxvk::high_resolution_clock::now();
+
+    m_heliosPresentWaits += 1u;
+    m_heliosPresentWaitUsTotal += uint64_t(
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+
+    if (vr != VK_SUCCESS) {
+      // Copy anyway — a rare one-frame ghost self-heals at the next acquire;
+      // wedging the IDD never does. VK_TIMEOUT here with a healthy producer
+      // means the wait budget is too small for real GPU work; anything else
+      // is a broken retire chain and must stay loud.
+      m_heliosPresentWaitTimeouts += 1u;
+      Logger::warn(str::format("Helios present-wait: resid ", resid,
+        " value ", value, " NOT reached (", vr, ", fence at ",
+        fence->getValue(), ") within ", waitUs,
+        "us — copying anyway (x", m_heliosPresentWaitTimeouts, ")"));
+    }
+
+    if ((m_heliosPresentWaits % 128u) == 0u) {
+      Logger::info(str::format("present-wait: waits=", m_heliosPresentWaits,
+        " avg_us=", m_heliosPresentWaitUsTotal / m_heliosPresentWaits,
+        " timeouts=", m_heliosPresentWaitTimeouts,
+        " fast=", m_heliosPresentWaitFast,
+        " noslot=", m_heliosPresentWaitNoSlot,
+        " gate_flushes=", HeliosPresentSync::gateFlushCount(),
+        " refresh_skips=", m_heliosRefreshSkips));
+    }
+  }
+
+
+  DxvkFence* DxvkContext::heliosProducerFence(uint32_t pid, uint32_t fenceId) {
     // Keyed by (pid, fenceId): one producer process owns several D3D11
     // devices, each with its own named fence; a recreated device in the
     // same pid gets a fresh fence id, which naturally invalidates the cache.
@@ -9462,7 +9504,7 @@ namespace dxvk {
     if (entry.fence == nullptr) {
       if (entry.retryCountdown > 0u) {
         entry.retryCountdown -= 1u;
-        return;
+        return nullptr;
       }
 
       // Import the producer's named present fence. A dead producer (stale
@@ -9487,43 +9529,11 @@ namespace dxvk {
           Logger::warn(str::format("Helios present-wait: import of producer pid ",
             pid, " fence FAILED (x", n, "): ", e.message()));
         }
-        return;
+        return nullptr;
       }
     }
 
-    if (entry.fence->getValue() >= value) {
-      m_heliosPresentWaitFast += 1u;
-      return;
-    }
-
-    const auto t0 = dxvk::high_resolution_clock::now();
-    const VkResult vr = entry.fence->waitBounded(value, uint64_t(waitUs) * 1000u);
-    const auto t1 = dxvk::high_resolution_clock::now();
-
-    m_heliosPresentWaits += 1u;
-    m_heliosPresentWaitUsTotal += uint64_t(
-      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
-
-    if (vr != VK_SUCCESS) {
-      // Copy anyway — a rare one-frame ghost self-heals at the next acquire;
-      // wedging the IDD never does. VK_TIMEOUT here with a healthy producer
-      // means the wait budget is too small for real GPU work; anything else
-      // is a broken retire chain and must stay loud.
-      m_heliosPresentWaitTimeouts += 1u;
-      Logger::warn(str::format("Helios present-wait: resid ", resid,
-        " value ", value, " NOT reached (", vr, ", fence at ",
-        entry.fence->getValue(), ") within ", waitUs,
-        "us — copying anyway (x", m_heliosPresentWaitTimeouts, ")"));
-    }
-
-    if ((m_heliosPresentWaits % 128u) == 0u) {
-      Logger::info(str::format("present-wait: waits=", m_heliosPresentWaits,
-        " avg_us=", m_heliosPresentWaitUsTotal / m_heliosPresentWaits,
-        " timeouts=", m_heliosPresentWaitTimeouts,
-        " fast=", m_heliosPresentWaitFast,
-        " noslot=", m_heliosPresentWaitNoSlot,
-        " gate_flushes=", HeliosPresentSync::gateFlushCount()));
-    }
+    return entry.fence.ptr();
   }
 
 
@@ -9586,6 +9596,43 @@ namespace dxvk {
       if (!image->isHeliosGdiStaged() || (staging == nullptr && stagingImage == nullptr)) {
         ++entry;
         continue;
+      }
+
+      // Skip-if-unretired (28th session): when the image's newest published
+      // value is KWAIT-ORDERED (the producer's flip is dxgkrnl-held until
+      // the value retires) and has not retired yet, this consumer cannot be
+      // sampling the image this list — its flip has not completed. The
+      // copy-execution wait below would block the CS thread ~a full copy
+      // latency (dwm measured 8.9 ms per hit = the windowed-game
+      // composition stutter) for content nothing samples yet. Keep the
+      // current staged bytes, re-arm the bind-time gate so the retry
+      // converges even if no newer publish arrives, and count. NEVER
+      // applied to non-kwait publishes (dwm->IddCx): there the bounded
+      // wait IS the orderer, and skipping could freeze the captured
+      // display one frame behind on an idle desktop.
+      if (m_device->config().heliosSkipUnretiredRefresh) {
+        const uint32_t resid = image->info().sharing.heliosResourceId;
+        uint32_t slotPid = 0u, slotFenceId = 0u;
+        uint64_t slotValue = 0u;
+        bool kwaitOrdered = false;
+
+        if (resid
+         && HeliosPresentSync::lookup(resid, &slotPid, &slotFenceId, &slotValue, &kwaitOrdered)
+         && kwaitOrdered
+         && slotValue > image->heliosLastRefreshValue()) {
+          DxvkFence* fence = heliosProducerFence(slotPid, slotFenceId);
+
+          if (fence != nullptr && fence->getValue() < slotValue) {
+            image->heliosReleaseFlushClaim(slotValue);
+            m_heliosRefreshSkips += 1u;
+            if ((m_heliosRefreshSkips % 512u) == 1u) {
+              Logger::info(str::format("refresh-skip: unretired kwait value, "
+                "staged bytes kept (x", m_heliosRefreshSkips, ", resid ", resid, ")"));
+            }
+            ++entry;
+            continue;
+          }
+        }
       }
 
       VkImageSubresourceLayers subresource = { };

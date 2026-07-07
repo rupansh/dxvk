@@ -1454,6 +1454,11 @@ namespace dxvk {
      * target value had already retired (no wait needed) */
     uint64_t                                  m_heliosPresentWaitNoSlot   = 0u;
     uint64_t                                  m_heliosPresentWaitFast     = 0u;
+    /* staged re-stages skipped because the newest published value is
+     * kwait-ordered and not yet retired (the consumer cannot be sampling
+     * that image yet — its flip is kernel-held; blocking here was dwm's
+     * 9 ms windowed-game composition stall, 28th session) */
+    uint64_t                                  m_heliosRefreshSkips        = 0u;
 
     DxvkDescriptorCopyWorker m_descriptorWorker;
 
@@ -2020,6 +2025,10 @@ namespace dxvk {
 
     void heliosPresentWaitBeforeRefresh(
       const Rc<DxvkImage>&      image);
+
+    DxvkFence* heliosProducerFence(
+            uint32_t            pid,
+            uint32_t            fenceId);
 
     void releaseSharedImagesToExternal();
 

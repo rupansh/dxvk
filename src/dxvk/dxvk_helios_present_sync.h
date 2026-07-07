@@ -34,15 +34,28 @@ namespace dxvk {
      * Producer side; called on the present path (cheap: a few relaxed
      * atomics). Fails loudly-but-throttled when the table is unavailable
      * or full.
+     *
+     * \c kwaitOrdered advertises that this present's FLIP is kernel-held
+     * (dxgkrnl GPU-side wait) until \c value retires — a consumer that
+     * finds the value unretired is running ahead of the flip and may keep
+     * its current staged bytes instead of blocking (the dwm 9 ms
+     * composition stalls, 28th session). Carried as bit 30 of the slot's
+     * fenceId — free in both id spaces: UMD ids are a small low counter,
+     * ICD ids are 0x80000000|counter.
      * \returns \c false when the slot could not be written
      */
-    static bool publish(uint32_t resid, uint32_t pid, uint32_t fenceId, uint64_t value);
+    static bool publish(uint32_t resid, uint32_t pid, uint32_t fenceId, uint64_t value,
+      bool kwaitOrdered = false);
 
     /**
      * \brief Looks up the latest published (pid, value) for a resource id
+     *
+     * \c fenceId is returned STRIPPED of the kwait flag bit; the flag is
+     * reported via \c kwaitOrdered when non-null.
      * \returns \c false when no slot exists for \c resid
      */
-    static bool lookup(uint32_t resid, uint32_t* pid, uint32_t* fenceId, uint64_t* value);
+    static bool lookup(uint32_t resid, uint32_t* pid, uint32_t* fenceId, uint64_t* value,
+      bool* kwaitOrdered = nullptr);
 
     /**
      * \brief Counts a bind-time staleness-gate flush

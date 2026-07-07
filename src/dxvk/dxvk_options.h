@@ -74,6 +74,16 @@ namespace dxvk {
     /// surface triage.
     bool heliosStagedProbes = false;
 
+    /// Helios staged refresh: skip re-staging an image whose newest
+    /// published value is (a) kwait-ordered — the producer's flip is
+    /// kernel-held until the value retires — and (b) not yet retired.
+    /// The consumer cannot be sampling that image yet (its flip has not
+    /// completed), so blocking the CS thread for it only stalls the
+    /// composition of OTHER content (dwm's 9 ms windowed-game hitches,
+    /// 28th session). The current staged bytes stay; the bind-time gate
+    /// is re-armed so the retry converges. Kill switch for A/B.
+    bool heliosSkipUnretiredRefresh = true;
+
     /// Disable VK_NV_low_latency2. This extension
     /// appears to be all sorts of broken on 32-bit.
     Tristate disableNvLowLatency2 = Tristate::Auto;
