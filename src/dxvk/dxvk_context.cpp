@@ -9622,7 +9622,8 @@ namespace dxvk {
         " avg_us=", m_heliosPresentWaitUsTotal / m_heliosPresentWaits,
         " timeouts=", m_heliosPresentWaitTimeouts,
         " fast=", m_heliosPresentWaitFast,
-        " noslot=", m_heliosPresentWaitNoSlot));
+        " noslot=", m_heliosPresentWaitNoSlot,
+        " gate_flushes=", HeliosPresentSync::gateFlushCount()));
     }
   }
 

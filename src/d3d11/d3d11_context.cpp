@@ -3576,8 +3576,10 @@ namespace dxvk {
         return;
       }
 
-      if (flushNeeded)
+      if (flushNeeded) {
+        HeliosPresentSync::noteGateFlush();
         static_cast<D3D11ImmediateContext*>(this)->Flush();
+      }
     }
   }
 
