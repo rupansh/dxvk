@@ -85,6 +85,19 @@ namespace dxvk {
         imageInfo.sharing.heliosResourceId      = pHeliosImport->ResourceId;
         imageInfo.sharing.heliosAllocSize       = pHeliosImport->AllocSize;
         imageInfo.sharing.heliosMemoryTypeIndex = pHeliosImport->MemoryTypeIndex;
+
+        // Fix B (symmetric scan-out-primary import): the creator exported this
+        // surface as a DRM_FORMAT_MODIFIER(LINEAR) + DMA_BUF scan-out primary.
+        // A plain OPTIMAL rebuild needs a larger backing than the exporter's
+        // modifier(LINEAR) allocation, so DXVK's undersize-import guard rejects
+        // it → open_resource E_FAIL → blank desktop. Rebuild the import with the
+        // SAME modifier tiling + DMA_BUF handle type (dxvk_image.cpp keys the
+        // modifier build off heliosScanoutPrimary) so its size matches the
+        // exporter's. Import mode is preserved (do NOT flip to Export).
+        if (pHeliosImport->ModifierLinear) {
+          imageInfo.heliosScanoutPrimary = VK_TRUE;
+          imageInfo.sharing.type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        }
       }
     }
 
@@ -229,8 +242,11 @@ namespace dxvk {
     // must never take the host-visible LINEAR direct-map path below (that would
     // override the DRM-modifier tiling and pin the image in host-visible memory,
     // which cannot back a dmabuf scan-out source). Force map mode NONE + a
-    // device-local allocation regardless of the desc's CPU-access flags.
-    if (pHeliosCreate && pHeliosCreate->ScanoutPrimary) {
+    // device-local allocation regardless of the desc's CPU-access flags. This
+    // applies to both the create path (pHeliosCreate->ScanoutPrimary) and the
+    // symmetric Fix B import path (pHeliosImport->ModifierLinear).
+    if ((pHeliosCreate && pHeliosCreate->ScanoutPrimary) ||
+        (pHeliosImport && pHeliosImport->ModifierLinear)) {
       m_mapMode        = D3D11_COMMON_TEXTURE_MAP_MODE_NONE;
       memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     }

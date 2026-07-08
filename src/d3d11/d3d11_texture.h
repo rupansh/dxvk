@@ -86,6 +86,10 @@ namespace dxvk {
     uint32_t ResourceId       = 0u;
     uint64_t AllocSize        = 0u;
     uint32_t MemoryTypeIndex  = ~0u;
+    // When true, reconstruct the imported shared surface as
+    // DRM_FORMAT_MODIFIER(LINEAR)+DMA_BUF to match a scan-out-primary export,
+    // instead of plain OPTIMAL.
+    bool     ModifierLinear   = false;
   };
 
 
