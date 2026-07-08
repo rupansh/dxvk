@@ -26,7 +26,8 @@ namespace dxvk {
           DXGI_USAGE                  DxgiUsage,
           VkImage                     vkImage,
           HANDLE                      hSharedHandle,
-    const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport)
+    const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport,
+    const D3D11_HELIOS_CREATE_INFO*   pHeliosCreate)
   : m_interface(pInterface), m_device(pDevice), m_dimension(Dimension), m_desc(*pDesc),
     m_11on12(p11on12Info ? *p11on12Info : D3D11_ON_12_RESOURCE_INFO()), m_dxgiUsage(DxgiUsage) {
     DXGI_VK_FORMAT_MODE   formatMode   = GetFormatMode();
@@ -85,6 +86,21 @@ namespace dxvk {
         imageInfo.sharing.heliosAllocSize       = pHeliosImport->AllocSize;
         imageInfo.sharing.heliosMemoryTypeIndex = pHeliosImport->MemoryTypeIndex;
       }
+    }
+
+    // Helios DWM scan-out primary: force an Export-mode DMA_BUF share with a
+    // DRM_FORMAT_MODIFIER(LINEAR) backing image so virtio-gpu SET_SCANOUT_BLOB
+    // can export a dmabuf the host display understands (a plain OPTIMAL/LINEAR
+    // image → MOD_INVALID → host paints black). dxvk_image.cpp reads the
+    // heliosScanoutPrimary marker to apply the modifier tiling + DMA_BUF export
+    // at create time; here we only classify the surface as a renderer Export
+    // share, independent of the desc's D3D11 sharing MiscFlags.
+    if (pHeliosCreate && pHeliosCreate->ScanoutPrimary) {
+      imageInfo.heliosScanoutPrimary = VK_TRUE;
+      imageInfo.shared               = VK_TRUE;
+      imageInfo.sharing.mode         = DxvkSharedHandleMode::Export;
+      imageInfo.sharing.type         = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      imageInfo.sharing.handle       = INVALID_HANDLE_VALUE;
     }
 
     if (!pDevice->GetOptions()->disableMsaa)
@@ -208,6 +224,16 @@ namespace dxvk {
     // Determine map mode based on our findings
     VkMemoryPropertyFlags memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     std::tie(m_mapMode, memoryProperties) = DetermineMapMode(pDevice, &imageInfo);
+
+    // The scan-out primary is a device-local surface the host scans out of; it
+    // must never take the host-visible LINEAR direct-map path below (that would
+    // override the DRM-modifier tiling and pin the image in host-visible memory,
+    // which cannot back a dmabuf scan-out source). Force map mode NONE + a
+    // device-local allocation regardless of the desc's CPU-access flags.
+    if (pHeliosCreate && pHeliosCreate->ScanoutPrimary) {
+      m_mapMode        = D3D11_COMMON_TEXTURE_MAP_MODE_NONE;
+      memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    }
     
     // If the image is mapped directly to host memory, we need
     // to enable linear tiling, and DXVK needs to be aware that
@@ -1468,9 +1494,10 @@ namespace dxvk {
     const D3D11_COMMON_TEXTURE_DESC*  pDesc,
     const D3D11_ON_12_RESOURCE_INFO*  p11on12Info,
           HANDLE                      hSharedHandle,
-    const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport)
+    const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport,
+    const D3D11_HELIOS_CREATE_INFO*   pHeliosCreate)
   : D3D11DeviceChild<ID3D11Texture2D1>(pDevice),
-    m_texture   (this, pDevice, pDesc, p11on12Info, D3D11_RESOURCE_DIMENSION_TEXTURE2D, 0, VK_NULL_HANDLE, hSharedHandle, pHeliosImport),
+    m_texture   (this, pDevice, pDesc, p11on12Info, D3D11_RESOURCE_DIMENSION_TEXTURE2D, 0, VK_NULL_HANDLE, hSharedHandle, pHeliosImport, pHeliosCreate),
     m_interop   (this, &m_texture),
     m_surface   (this),
     m_resource  (this, pDevice),
