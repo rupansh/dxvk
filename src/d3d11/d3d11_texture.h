@@ -90,6 +90,21 @@ namespace dxvk {
 
 
   /**
+   * \brief Helios texture creation hints
+   *
+   * Out-of-band creation flags the d3d10umddi frontend threads into DXVK for
+   * surfaces the D3D11 desc alone cannot describe.
+   */
+  struct D3D11_HELIOS_CREATE_INFO {
+    // The DWM scan-out primary: create the backing DXVK image as a
+    // DRM_FORMAT_MODIFIER(LINEAR) + DMA_BUF-exportable surface so virtio-gpu
+    // SET_SCANOUT_BLOB can hand the host display a dmabuf it can import
+    // (a plain OPTIMAL/LINEAR image exports as MOD_INVALID → host paints black).
+    bool ScanoutPrimary = false;
+  };
+
+
+  /**
    * \brief D3D11 common texture object
    * 
    * This class implements common texture methods and
@@ -111,7 +126,8 @@ namespace dxvk {
             DXGI_USAGE                  DxgiUsage,
             VkImage                     vkImage,
             HANDLE                      hSharedHandle,
-      const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport = nullptr);
+      const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport = nullptr,
+      const D3D11_HELIOS_CREATE_INFO*   pHeliosCreate = nullptr);
     
     ~D3D11CommonTexture();
     
@@ -824,7 +840,8 @@ namespace dxvk {
       const D3D11_COMMON_TEXTURE_DESC*  pDesc,
       const D3D11_ON_12_RESOURCE_INFO*  p11on12Info,
             HANDLE                      hSharedHandle,
-      const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport = nullptr);
+      const D3D11_HELIOS_IMPORT_INFO*   pHeliosImport = nullptr,
+      const D3D11_HELIOS_CREATE_INFO*   pHeliosCreate = nullptr);
 
     D3D11Texture2D(
             D3D11Device*                pDevice,

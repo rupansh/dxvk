@@ -83,6 +83,14 @@ namespace dxvk {
     // directly (recursion guard).
     VkBool32 heliosDirectImportAlias = VK_FALSE;
 
+    // Helios: this image is the DWM scan-out primary. It must be created as a
+    // DRM_FORMAT_MODIFIER(LINEAR) + DMA_BUF-exportable image so virtio-gpu
+    // SET_SCANOUT_BLOB can export a dmabuf the host display understands (a plain
+    // OPTIMAL/LINEAR image exports as MOD_INVALID → host paints black). Forces
+    // tiling=DRM_FORMAT_MODIFIER_EXT, a single LINEAR modifier, DMA_BUF export,
+    // and a dedicated allocation.
+    VkBool32 heliosScanoutPrimary = VK_FALSE;
+
     // Debug name
     const char* debugName = nullptr;
   };

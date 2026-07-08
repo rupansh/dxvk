@@ -96,6 +96,24 @@ namespace dxvk {
     VkImageSubresource2KHR subresourceInfo = { VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2_KHR };
     subresourceInfo.imageSubresource = subresource;
 
+    // Helios scan-out primary: its storage is a DRM_FORMAT_MODIFIER(LINEAR)
+    // image, not plain LINEAR. Query the true row pitch/offset of memory plane 0
+    // under that modifier (the layout the exported dmabuf actually has) so the
+    // UMD reports the real stride+offset to virtio-gpu SET_SCANOUT_BLOB — a
+    // width*4 guess shears, and a plain-LINEAR query can disagree with the
+    // modifier layout.
+    uint64_t heliosLinearModifier = 0ull; // DRM_FORMAT_MOD_LINEAR
+    VkImageDrmFormatModifierListCreateInfoEXT heliosModifierList =
+      { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT };
+    if (createInfo.heliosScanoutPrimary) {
+      info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+      heliosModifierList.drmFormatModifierCount = 1u;
+      heliosModifierList.pDrmFormatModifiers = &heliosLinearModifier;
+      heliosModifierList.pNext = info.pNext;
+      info.pNext = &heliosModifierList;
+      subresourceInfo.imageSubresource.aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT;
+    }
+
     VkDeviceImageSubresourceInfoKHR query = { VK_STRUCTURE_TYPE_DEVICE_IMAGE_SUBRESOURCE_INFO_KHR };
     query.pCreateInfo = &info;
     query.pSubresource = &subresourceInfo;
