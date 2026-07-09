@@ -194,6 +194,7 @@ namespace dxvk {
       
       // On success, pass it on to the queue thread
       Rc<DxvkCommandList> droppedCmdList;
+      bool droppedDeviceLost = false;
 
       { std::unique_lock<dxvk::mutex> lock(m_mutex);
 
@@ -204,25 +205,46 @@ namespace dxvk {
           m_finishQueue.push(std::move(entry));
         } else {
           Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", entry.result));
+          droppedDeviceLost = (entry.result == VK_ERROR_DEVICE_LOST);
           m_lastError = entry.result;
 
           if (m_lastError != VK_ERROR_DEVICE_LOST)
             m_device->waitForIdle();
 
           // HELIOS: a dropped submission still holds lifetime refs on every
-          // resource recorded into it. Without notifyObjects() those refs
-          // leak and a later waitForResource() on any of them never returns
-          // (2026-07-05: dwm compositor wedged in Map after device loss).
-          // The command list was never submitted, so its buffers are not
-          // pending and resetting them below is legal.
+          // resource recorded into it. On a HEALTHY-device failure the
+          // waitForIdle above drained the GPU, so nothing is pending: without
+          // notifyObjects() those refs would leak and a later
+          // waitForResource() on any of them never returns (2026-07-05: dwm
+          // compositor wedged in Map). reset()+recycle below is then legal.
+          //
+          // But when the device is LOST the waitForIdle is skipped and the
+          // host may still be executing EARLIER submissions we deliberately
+          // leaked in finishCmdLists. reset() here would run the descriptor
+          // pool's monotonic notifyCompletion(), which resets every still-
+          // InFlight pool with a lower tracking id — including those earlier
+          // pending pools (2026-07-09 host log: vkResetDescriptorPool "in use
+          // by VkCommandBuffer"); and releasing refs would free resources
+          // those pending buffers reference. So on loss leak the dropped list
+          // whole instead (device loss ends the device anyway).
           droppedCmdList = std::move(entry.submit.cmdList);
         }
 
         m_submitQueue.pop();
         m_submitCond.notify_all();
+
+        if (droppedDeviceLost && droppedCmdList != nullptr) {
+          m_leakedCmdLists.push_back(std::move(droppedCmdList));
+          Logger::err(str::format("DxvkSubmissionQueue: leaking dropped command "
+            "list (device lost); leaked=", m_leakedCmdLists.size()));
+          // Wake synchronizeUntil waiters so they observe m_lastError.
+          m_finishCond.notify_all();
+        }
       }
 
       if (droppedCmdList != nullptr) {
+        // Reached only on a healthy-device failure (GPU drained above): safe
+        // to release refs, reset pools and recycle the list.
         droppedCmdList->notifyObjects();
         droppedCmdList->reset();
         m_device->recycleCommandList(droppedCmdList);
@@ -316,7 +338,20 @@ namespace dxvk {
       // Release resources and signal events, then immediately wake
       // up any thread that's currently waiting on a resource in
       // order to reduce delays as much as possible.
-      if (entry.submit.cmdList != nullptr)
+      //
+      // HELIOS: only release the object-tracker refs when the host actually
+      // retired the work. When the guest-side loss latch fires while the HOST
+      // is still executing the submission (hostRetired == false),
+      // notifyObjects() would drop this list's lifetime refs on every image,
+      // view, buffer and memory it recorded — letting dwm's teardown destroy
+      // objects a still-pending (leaked) command buffer references. That is
+      // the 2026-07-09 host-log flood (vkDestroyImage / vkDestroyImageView /
+      // vkFreeMemory "currently in use by VkCommandBuffer/VkDescriptorSet"
+      // preceding every dwm CS-error death). The leaked command list below
+      // retains those refs, keeping the resources alive (and the descriptor
+      // pool un-reset) until the process exits. waitForResource already bails
+      // on DEVICE_LOST, so retaining the refs cannot wedge a Map waiter.
+      if (entry.submit.cmdList != nullptr && hostRetired)
         entry.submit.cmdList->notifyObjects();
 
       lock.lock();
@@ -330,13 +365,15 @@ namespace dxvk {
           entry.submit.cmdList->reset();
           m_device->recycleCommandList(entry.submit.cmdList);
         } else {
-          // HELIOS: host work never retired (device lost). Keep the command
-          // list alive forever — resetting/destroying a pool with pending
-          // buffers corrupts the (possibly healthy) host device. Loud, and
-          // bounded in practice: device loss ends the device's useful life.
-          Logger::err("DxvkSubmissionQueue: leaking command list with unretired host work (device lost)");
+          // HELIOS: host work never retired (device lost). Keep the WHOLE
+          // command list alive forever (its object-tracker refs included, per
+          // above) — resetting/destroying a pool or freeing a resource with
+          // pending buffers corrupts the (possibly healthy) host device. Loud,
+          // and bounded in practice: device loss ends the device's useful life.
           std::unique_lock<dxvk::mutex> leakLock(m_mutex);
           m_leakedCmdLists.push_back(std::move(entry.submit.cmdList));
+          Logger::err(str::format("DxvkSubmissionQueue: leaking command list "
+            "with unretired host work (device lost); leaked=", m_leakedCmdLists.size()));
         }
       }
     }
