@@ -86,10 +86,10 @@ namespace dxvk {
     uint32_t ResourceId       = 0u;
     uint64_t AllocSize        = 0u;
     uint32_t MemoryTypeIndex  = ~0u;
-    // When true, reconstruct the imported shared surface as
-    // DRM_FORMAT_MODIFIER(LINEAR)+DMA_BUF to match a scan-out-primary export,
-    // instead of plain OPTIMAL.
-    bool     ModifierLinear   = false;
+    // When true, reconstruct the imported shared surface as the same plain
+    // LINEAR + DMA_BUF image used by the scan-out-primary exporter.
+    bool     ScanoutLinear    = false;
+    bool     LinearScanoutTarget = false;
   };
 
 
@@ -100,11 +100,11 @@ namespace dxvk {
    * surfaces the D3D11 desc alone cannot describe.
    */
   struct D3D11_HELIOS_CREATE_INFO {
-    // The DWM scan-out primary: create the backing DXVK image as a
-    // DRM_FORMAT_MODIFIER(LINEAR) + DMA_BUF-exportable surface so virtio-gpu
-    // SET_SCANOUT_BLOB can hand the host display a dmabuf it can import
-    // (a plain OPTIMAL/LINEAR image exports as MOD_INVALID → host paints black).
+    // The DWM scan-out primary: create the backing DXVK image as a plain
+    // LINEAR + DMA_BUF-exportable surface. NVIDIA/Venus visibly scans this
+    // shape without a DRM modifier.
     bool ScanoutPrimary = false;
+    bool DirectOptimalScanout = false;
   };
 
 

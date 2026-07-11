@@ -31,10 +31,10 @@ namespace dxvk {
       return value && value[0] == '1' && value[1] == '\0';
     }
 
-    // Helios present-vs-absent probe (13th session): route DEVICE-LOCAL shared
-    // imports through the host-visible buffer-staging path (raw-byte buffer read +
-    // copyBufferToImage) so we can see whether the shared memory holds the
-    // creator's pixels (scrambled/tiled = present) or is empty (black = absent).
+    // Helios experimental device-local alias refresh. Keep it opt-in: enabling
+    // this globally makes DWM rebuild every imported display surface through a
+    // second image and currently crash-loops composition during initialization.
+    // The committed direct-import path remains the production baseline.
     bool heliosDevlocalStaging() {
       const char* value = std::getenv("HELIOS_DEVLOCAL_STAGING");
       return value && value[0] == '1' && value[1] == '\0';
@@ -262,6 +262,8 @@ namespace dxvk {
         " memType=", m_info.sharing.heliosMemoryTypeIndex,
         " staged=", (m_heliosGdiStaged ? 1u : 0u),
         " alias=", (m_info.heliosDirectImportAlias ? 1u : 0u),
+        " scanoutTarget=", (m_info.heliosLinearScanoutTarget ? 1u : 0u),
+        " directOptimal=", (m_info.heliosDirectOptimalScanout ? 1u : 0u),
         " usage=0x", std::hex, uint32_t(m_info.usage),
         " flags=0x", uint32_t(m_info.flags), std::dec));
     }
@@ -435,7 +437,8 @@ namespace dxvk {
     // exports the renderer opaque-fd handle. Both externalInfo.handleTypes and
     // sharedExport.handleTypes below key off this.
     VkExternalMemoryHandleTypeFlagBits heliosRendererHandleType =
-      m_info.heliosScanoutPrimary
+      (m_info.heliosScanoutPrimary || m_info.heliosLinearScanoutTarget
+       || m_info.heliosDirectOptimalScanout)
         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
         : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 
@@ -453,6 +456,7 @@ namespace dxvk {
     // round_up(width*4,256) byte stride.
     const bool heliosImportCandidate = useHeliosRendererExternalMemory
      && !m_info.heliosDirectImportAlias
+     && !m_info.heliosLinearScanoutTarget
      && m_info.sharing.mode == DxvkSharedHandleMode::Import
      && m_info.sharing.heliosResourceId
      && m_info.sharing.heliosAllocSize
@@ -650,29 +654,6 @@ namespace dxvk {
 
     if (m_info.transient)
       allocationInfo.mode.set(DxvkAllocationMode::NoDedicated);
-
-    // Helios scan-out primary: create as a DRM_FORMAT_MODIFIER(LINEAR) image so
-    // the exported dmabuf carries an explicit modifier the host display can
-    // import (a plain OPTIMAL/LINEAR image → MOD_INVALID → host paints black).
-    // The DMA_BUF export handle type is already selected above
-    // (heliosRendererHandleType) and a dedicated allocation is forced for every
-    // KMT-shared image (forceDedicated). Chain the single-modifier list last.
-    uint64_t heliosScanoutModifier = 0ull; // DRM_FORMAT_MOD_LINEAR
-    VkImageDrmFormatModifierListCreateInfoEXT heliosModifierList =
-      { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT };
-    if (m_info.heliosScanoutPrimary) {
-      imageInfo.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-      // VU 02261: DRM-modifier tiling + MUTABLE_FORMAT requires a non-empty
-      // VkImageFormatListCreateInfo in the chain. It was chained above only if
-      // the image had view formats; if not, drop MUTABLE_FORMAT so the create
-      // is legal — the managed primary is single-format BGRA and never needs a
-      // differing-format reinterpret view.
-      if ((imageInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !formatList.viewFormatCount)
-        imageInfo.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-      heliosModifierList.drmFormatModifierCount = 1u;
-      heliosModifierList.pDrmFormatModifiers = &heliosScanoutModifier;
-      heliosModifierList.pNext = std::exchange(imageInfo.pNext, &heliosModifierList);
-    }
 
     return m_allocator->createImageResource(imageInfo,
       allocationInfo, sharedMemoryInfo);

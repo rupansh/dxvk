@@ -83,13 +83,19 @@ namespace dxvk {
     // directly (recursion guard).
     VkBool32 heliosDirectImportAlias = VK_FALSE;
 
-    // Helios: this image is the DWM scan-out primary. It must be created as a
-    // DRM_FORMAT_MODIFIER(LINEAR) + DMA_BUF-exportable image so virtio-gpu
-    // SET_SCANOUT_BLOB can export a dmabuf the host display understands (a plain
-    // OPTIMAL/LINEAR image exports as MOD_INVALID → host paints black). Forces
-    // tiling=DRM_FORMAT_MODIFIER_EXT, a single LINEAR modifier, DMA_BUF export,
-    // and a dedicated allocation.
+    // Helios: this image is the exact DWM scan-out primary. It is a plain
+    // LINEAR + DMA_BUF image; ordinary shared images remain OPTIMAL + OPAQUE_FD.
     VkBool32 heliosScanoutPrimary = VK_FALSE;
+
+    // Windows designated this image as a VidPn primary. Keep ordinary OPTIMAL
+    // tiling for DWM rendering, but export dedicated DMA_BUF storage so the
+    // host can scan out the same backing allocation directly.
+    VkBool32 heliosDirectOptimalScanout = VK_FALSE;
+
+    // Helios: direct import of the KMD-owned plain-LINEAR VidPn primary. This
+    // is a transfer destination, not a sampled GDI surface: keep its LINEAR
+    // image bound directly to the imported resource and bypass staging.
+    VkBool32 heliosLinearScanoutTarget = VK_FALSE;
 
     // Debug name
     const char* debugName = nullptr;

@@ -86,34 +86,43 @@ namespace dxvk {
         imageInfo.sharing.heliosAllocSize       = pHeliosImport->AllocSize;
         imageInfo.sharing.heliosMemoryTypeIndex = pHeliosImport->MemoryTypeIndex;
 
-        // Fix B (symmetric scan-out-primary import): the creator exported this
-        // surface as a DRM_FORMAT_MODIFIER(LINEAR) + DMA_BUF scan-out primary.
-        // A plain OPTIMAL rebuild needs a larger backing than the exporter's
-        // modifier(LINEAR) allocation, so DXVK's undersize-import guard rejects
-        // it → open_resource E_FAIL → blank desktop. Rebuild the import with the
-        // SAME modifier tiling + DMA_BUF handle type (dxvk_image.cpp keys the
-        // modifier build off heliosScanoutPrimary) so its size matches the
-        // exporter's. Import mode is preserved (do NOT flip to Export).
-        if (pHeliosImport->ModifierLinear) {
+        // Symmetric scan-out-primary import: reconstruct the creator's exact
+        // plain LINEAR + DMA_BUF image. Import mode is preserved, and ordinary
+        // shared OPTIMAL images are untouched.
+        if (pHeliosImport->ScanoutLinear) {
           imageInfo.heliosScanoutPrimary = VK_TRUE;
-          imageInfo.sharing.type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+          imageInfo.tiling                = VK_IMAGE_TILING_LINEAR;
+          imageInfo.initialLayout         = VK_IMAGE_LAYOUT_PREINITIALIZED;
+          imageInfo.sharing.type          = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        }
+        if (pHeliosImport->LinearScanoutTarget) {
+          imageInfo.heliosLinearScanoutTarget = VK_TRUE;
+          imageInfo.tiling = VK_IMAGE_TILING_LINEAR;
         }
       }
     }
 
-    // Helios DWM scan-out primary: force an Export-mode DMA_BUF share with a
-    // DRM_FORMAT_MODIFIER(LINEAR) backing image so virtio-gpu SET_SCANOUT_BLOB
-    // can export a dmabuf the host display understands (a plain OPTIMAL/LINEAR
-    // image → MOD_INVALID → host paints black). dxvk_image.cpp reads the
-    // heliosScanoutPrimary marker to apply the modifier tiling + DMA_BUF export
-    // at create time; here we only classify the surface as a renderer Export
-    // share, independent of the desc's D3D11 sharing MiscFlags.
+    // Exact DWM scan-out primary: force the visibly-proven device-local plain
+    // LINEAR image and an Export-mode DMA_BUF share. No modifier extension is
+    // involved.
     if (pHeliosCreate && pHeliosCreate->ScanoutPrimary) {
       imageInfo.heliosScanoutPrimary = VK_TRUE;
+      imageInfo.tiling                = VK_IMAGE_TILING_LINEAR;
+      imageInfo.initialLayout         = VK_IMAGE_LAYOUT_PREINITIALIZED;
       imageInfo.shared               = VK_TRUE;
       imageInfo.sharing.mode         = DxvkSharedHandleMode::Export;
       imageInfo.sharing.type         = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
       imageInfo.sharing.handle       = INVALID_HANDLE_VALUE;
+    }
+
+    // Exact pPrimaryDesc path: preserve normal OPTIMAL render-target
+    // semantics while changing only the external allocation handle to DMA_BUF.
+    if (pHeliosCreate && pHeliosCreate->DirectOptimalScanout) {
+      imageInfo.heliosDirectOptimalScanout = VK_TRUE;
+      imageInfo.shared                     = VK_TRUE;
+      imageInfo.sharing.mode               = DxvkSharedHandleMode::Export;
+      imageInfo.sharing.type               = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      imageInfo.sharing.handle             = INVALID_HANDLE_VALUE;
     }
 
     if (!pDevice->GetOptions()->disableMsaa)
@@ -239,14 +248,13 @@ namespace dxvk {
     std::tie(m_mapMode, memoryProperties) = DetermineMapMode(pDevice, &imageInfo);
 
     // The scan-out primary is a device-local surface the host scans out of; it
-    // must never take the host-visible LINEAR direct-map path below (that would
-    // override the DRM-modifier tiling and pin the image in host-visible memory,
-    // which cannot back a dmabuf scan-out source). Force map mode NONE + a
+    // must never take the CPU direct-map path below. Force map mode NONE + a
     // device-local allocation regardless of the desc's CPU-access flags. This
     // applies to both the create path (pHeliosCreate->ScanoutPrimary) and the
-    // symmetric Fix B import path (pHeliosImport->ModifierLinear).
+    // symmetric scan-out import path (pHeliosImport->ScanoutLinear).
     if ((pHeliosCreate && pHeliosCreate->ScanoutPrimary) ||
-        (pHeliosImport && pHeliosImport->ModifierLinear)) {
+        (pHeliosImport && (pHeliosImport->ScanoutLinear ||
+                           pHeliosImport->LinearScanoutTarget))) {
       m_mapMode        = D3D11_COMMON_TEXTURE_MAP_MODE_NONE;
       memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     }
