@@ -1013,17 +1013,12 @@ namespace dxvk {
       ENABLE_EXT(khrExternalMemoryWin32, false),
       ENABLE_EXT(khrExternalSemaphoreWin32, false),
 
-      /* Helios venus ICD: fd-based external memory describes the renderer
-       * (host) side handle types; enabling it makes the ICD equip the host
-       * device with VK_KHR_external_memory_fd/VK_EXT_external_memory_dma_buf,
-       * which vkr's shared-surface export/import paths require.
-       *
-       * DMA_BUF + image_drm_format_modifier are enabled so the DWM scan-out
-       * primary can be a DRM_FORMAT_MODIFIER(LINEAR) DMA_BUF image — a
-       * virtio-gpu SET_SCANOUT_BLOB needs an explicit modifier + dmabuf export
-       * (a plain OPTIMAL/LINEAR image → MOD_INVALID → host paints black). */
+      /* Keep DMA_BUF available for the one KMD-owned plain-LINEAR scanout
+       * import, but never enable image_drm_format_modifier on DXVK devices.
+       * The latter is what changes ordinary OPTIMAL import requirements and
+       * caused the .38 undersized-import regression. Ordinary shared images
+       * below continue to declare OPAQUE_FD. */
       ENABLE_EXT(extExternalMemoryDmaBuf, false),
-      ENABLE_EXT(extImageDrmFormatModifier, false),
       ENABLE_EXT(khrExternalMemoryFd, false),
 
       /* LOAD_OP_NONE for certain tiler optimizations. Core feature

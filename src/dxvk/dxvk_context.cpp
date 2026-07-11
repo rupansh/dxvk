@@ -10,7 +10,7 @@
 #include "dxvk_helios_present_sync.h"
 
 namespace dxvk {
-  
+
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
   : m_device      (device),
     m_common      (&device->m_objects),
@@ -10439,18 +10439,10 @@ namespace dxvk {
     // (GENERAL) layout — layout-transition tracking alone misses producers
     // that render entirely in GENERAL.
     //
-    // Helios consumer-side QFOT acquire (13th-session black-desktop fix): a pure
-    // READER of an IMPORTED shared image (dwm sampling firefox/wallpaper/icons —
-    // device-local mem_type=1, not GDI-staged) previously enrolled nothing, so it
-    // never emitted the matching EXTERNAL->graphics acquire for the producer's
-    // release. On NVIDIA an EXCLUSIVE image released to VK_QUEUE_FAMILY_EXTERNAL
-    // has UNDEFINED contents for the consumer until it acquires it back — so the
-    // composited surface samples black/garbage. Enrolling imported images on READ
-    // makes them participate in the release(graphics->EXTERNAL)/acquire(EXTERNAL->
-    // graphics) cycle: the acquire at the next list start makes the producer's
-    // externally-released writes visible. The host-visible staged path is excluded
-    // (its per-frame copy already carries content); Export-mode producers are
-    // already handled by the write condition above.
+    // Helios consumer-side QFOT acquire: imported images sampled by DWM must
+    // participate in the EXTERNAL -> graphics ownership cycle even when this
+    // context only reads them. Without the acquire, NVIDIA may expose undefined
+    // contents after the producer's graphics -> EXTERNAL release.
     bool heliosImportRead = image.info().sharing.mode == DxvkSharedHandleMode::Import
       && (srcAccess & vk::AccessReadMask);
     if (unlikely(image.info().shared) && !image.isHeliosGdiStaged() && !image.isHeliosDebugMagenta()
@@ -10549,10 +10541,8 @@ namespace dxvk {
 
     batch.addMemoryBarrier(barrier);
 
-    // Helios: see the matching hook in accessImage — region writes to shared
-    // images (e.g. UpdateSubresource copies) also need the external release,
-    // except GDI-staged images (private device-local; never QFOT'd to EXTERNAL).
-    // The consumer-side QFOT acquire (imported shared image, read) applies here too.
+    // Helios: region reads of imported shared images need the same ownership
+    // acquire as whole-image reads above.
     bool heliosImportReadRegion = image.info().sharing.mode == DxvkSharedHandleMode::Import
       && (srcAccess & vk::AccessReadMask);
     if (unlikely(image.info().shared) && !image.isHeliosGdiStaged() && !image.isHeliosDebugMagenta()
