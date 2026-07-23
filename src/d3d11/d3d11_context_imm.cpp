@@ -946,24 +946,11 @@ namespace dxvk {
     if (m_submissionFence->value() >= submissionId)
       return true;
 
-    // Bounded poll outside the context lock. The typical completion is a few
-    // ms; stay hot briefly, then yield. No Sleep(1): its ~15.6 ms timer
-    // quantization is what dominated the old whole-device drain.
-    auto deadline = dxvk::high_resolution_clock::now()
-                  + std::chrono::microseconds(TimeoutUs);
-
-    for (uint32_t spin = 0; m_submissionFence->value() < submissionId; ++spin) {
-      if ((spin & 0x3ff) == 0x3ff
-       && dxvk::high_resolution_clock::now() >= deadline)
-        return false;
-
-      if (spin < 1024)
-        dxvk::this_thread::yield();
-      else
-        ::Sleep(0);
-    }
-
-    return true;
+    // Sleep on DXVK's submission-fence condition variable. The queue-completion
+    // thread wakes this immediately; the bounded timeout remains a loud
+    // last-resort escape instead of a scheduler-polling loop.
+    return m_submissionFence->waitFor(
+      submissionId, std::chrono::microseconds(TimeoutUs));
   }
 
 

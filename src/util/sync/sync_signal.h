@@ -170,6 +170,25 @@ namespace dxvk::sync {
       });
     }
 
+    template<typename Rep, typename Period>
+    bool waitFor(uint64_t value, const std::chrono::duration<Rep, Period>& timeout) {
+      if (value <= m_value.load(std::memory_order_acquire))
+        return true;
+
+      auto deadline = std::chrono::steady_clock::now() + timeout;
+      std::unique_lock<dxvk::mutex> lock(m_mutex);
+
+      while (value > m_value.load(std::memory_order_acquire)) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+          return false;
+
+        m_cond.wait_for(lock, deadline - now);
+      }
+
+      return true;
+    }
+
     template<typename Fn>
     void setCallback(uint64_t value, Fn&& proc) {
       if (value <= this->value()) {
