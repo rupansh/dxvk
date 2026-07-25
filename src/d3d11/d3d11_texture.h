@@ -90,6 +90,9 @@ namespace dxvk {
     // LINEAR + DMA_BUF image used by the scan-out-primary exporter.
     bool     ScanoutLinear    = false;
     bool     LinearScanoutTarget = false;
+    // KMD-created D3DKMDT_GDISURFACE_TEXTURE: preserve the creator's
+    // OPTIMAL+DMA_BUF cross-context image contract.
+    bool     CrossContextOptimal = false;
   };
 
 
@@ -100,10 +103,8 @@ namespace dxvk {
    * surfaces the D3D11 desc alone cannot describe.
    */
   struct D3D11_HELIOS_CREATE_INFO {
-    // The DWM scan-out primary: create the backing DXVK image as a plain
-    // LINEAR + DMA_BUF-exportable surface. NVIDIA/Venus visibly scans this
-    // shape without a DRM modifier.
-    bool ScanoutPrimary = false;
+    // The DWM scan-out primary: preserve normal OPTIMAL render-target
+    // semantics and export its allocation as a DMA_BUF.
     bool DirectOptimalScanout = false;
   };
 

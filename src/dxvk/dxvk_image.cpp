@@ -264,6 +264,7 @@ namespace dxvk {
         " alias=", (m_info.heliosDirectImportAlias ? 1u : 0u),
         " scanoutTarget=", (m_info.heliosLinearScanoutTarget ? 1u : 0u),
         " directOptimal=", (m_info.heliosDirectOptimalScanout ? 1u : 0u),
+        " crossContextOptimal=", (m_info.heliosCrossContextOptimal ? 1u : 0u),
         " usage=0x", std::hex, uint32_t(m_info.usage),
         " flags=0x", uint32_t(m_info.flags), std::dec));
     }
@@ -432,13 +433,12 @@ namespace dxvk {
     const bool heliosKmtShared = heliosKmtOnlySharedResources();
     bool useVulkanExternalMemory = m_shared && !heliosKmtShared;
     bool useHeliosRendererExternalMemory = m_shared && heliosKmtShared;
-    // The DWM scan-out primary exports a DMA_BUF (so virtio-gpu SET_SCANOUT_BLOB
-    // can hand the host display a dmabuf); every other Helios shared surface
-    // exports the renderer opaque-fd handle. Both externalInfo.handleTypes and
-    // sharedExport.handleTypes below key off this.
+    // Scan-out surfaces use DMA_BUF; ordinary shared surfaces retain the
+    // renderer opaque-fd handle. Both externalInfo.handleTypes and
+    // sharedExport.handleTypes key off this.
     VkExternalMemoryHandleTypeFlagBits heliosRendererHandleType =
       (m_info.heliosScanoutPrimary || m_info.heliosLinearScanoutTarget
-       || m_info.heliosDirectOptimalScanout)
+       || m_info.heliosDirectOptimalScanout || m_info.heliosCrossContextOptimal)
         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
         : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 
@@ -457,6 +457,7 @@ namespace dxvk {
     const bool heliosImportCandidate = useHeliosRendererExternalMemory
      && !m_info.heliosDirectImportAlias
      && !m_info.heliosLinearScanoutTarget
+     && !m_info.heliosCrossContextOptimal
      && m_info.sharing.mode == DxvkSharedHandleMode::Import
      && m_info.sharing.heliosResourceId
      && m_info.sharing.heliosAllocSize

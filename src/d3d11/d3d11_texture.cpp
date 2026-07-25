@@ -99,20 +99,11 @@ namespace dxvk {
           imageInfo.heliosLinearScanoutTarget = VK_TRUE;
           imageInfo.tiling = VK_IMAGE_TILING_LINEAR;
         }
+        if (pHeliosImport->CrossContextOptimal) {
+          imageInfo.heliosCrossContextOptimal = VK_TRUE;
+          imageInfo.sharing.type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        }
       }
-    }
-
-    // Exact DWM scan-out primary: force the visibly-proven device-local plain
-    // LINEAR image and an Export-mode DMA_BUF share. No modifier extension is
-    // involved.
-    if (pHeliosCreate && pHeliosCreate->ScanoutPrimary) {
-      imageInfo.heliosScanoutPrimary = VK_TRUE;
-      imageInfo.tiling                = VK_IMAGE_TILING_LINEAR;
-      imageInfo.initialLayout         = VK_IMAGE_LAYOUT_PREINITIALIZED;
-      imageInfo.shared               = VK_TRUE;
-      imageInfo.sharing.mode         = DxvkSharedHandleMode::Export;
-      imageInfo.sharing.type         = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-      imageInfo.sharing.handle       = INVALID_HANDLE_VALUE;
     }
 
     // Exact pPrimaryDesc path: preserve normal OPTIMAL render-target
@@ -221,6 +212,19 @@ namespace dxvk {
       imageInfo.shared = VK_TRUE;
     }
 
+    // The host reconstructs the exact Windows-designated primary allocation as
+    // a sampled, mutable OPTIMAL image. Keep the producer's VkImageCreateInfo
+    // and common layout identical even when the application's bind flags only
+    // request PRESENT + RENDER_TARGET (as Fire Strike does). This path is
+    // selected solely from pPrimaryDesc, never from resource geometry or the
+    // creating process.
+    if (pHeliosCreate && pHeliosCreate->DirectOptimalScanout) {
+      imageInfo.usage  |= VK_IMAGE_USAGE_SAMPLED_BIT;
+      imageInfo.stages |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      imageInfo.access |= VK_ACCESS_SHADER_READ_BIT;
+      imageInfo.flags  |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    }
+
     // Helios copy-free cross-process fix (13th session): a shared OPTIMAL image
     // and its cross-process importer alias one host allocation, but NVIDIA color
     // compression (DCC) keeps a PER-IMAGE compression-control surface that is NOT
@@ -240,8 +244,11 @@ namespace dxvk {
 
     // Some image formats (i.e. the R32G32B32 ones) are
     // only supported with linear tiling on most GPUs
-    if (!CheckImageSupport(&imageInfo, VK_IMAGE_TILING_OPTIMAL))
+    if (!CheckImageSupport(&imageInfo, VK_IMAGE_TILING_OPTIMAL)) {
+      if (pHeliosCreate && pHeliosCreate->DirectOptimalScanout)
+        throw DxvkError("D3D11: OPTIMAL tiling unsupported for Helios scan-out primary");
       imageInfo.tiling = VK_IMAGE_TILING_LINEAR;
+    }
     
     // Determine map mode based on our findings
     VkMemoryPropertyFlags memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -250,9 +257,9 @@ namespace dxvk {
     // The scan-out primary is a device-local surface the host scans out of; it
     // must never take the CPU direct-map path below. Force map mode NONE + a
     // device-local allocation regardless of the desc's CPU-access flags. This
-    // applies to both the create path (pHeliosCreate->ScanoutPrimary) and the
-    // symmetric scan-out import path (pHeliosImport->ScanoutLinear).
-    if ((pHeliosCreate && pHeliosCreate->ScanoutPrimary) ||
+    // applies to the direct OPTIMAL create path and to the symmetric KMD-owned
+    // LINEAR import paths.
+    if ((pHeliosCreate && pHeliosCreate->DirectOptimalScanout) ||
         (pHeliosImport && (pHeliosImport->ScanoutLinear ||
                            pHeliosImport->LinearScanoutTarget))) {
       m_mapMode        = D3D11_COMMON_TEXTURE_MAP_MODE_NONE;
@@ -305,7 +312,9 @@ namespace dxvk {
     // We must keep LINEAR images in GENERAL layout, but we
     // can choose a better layout for the image based on how
     // it is going to be used by the game.
-    if (imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && !isMultiPlane && imageInfo.sharing.mode == DxvkSharedHandleMode::None)
+    if (imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && !isMultiPlane
+     && (imageInfo.sharing.mode == DxvkSharedHandleMode::None
+      || (pHeliosCreate && pHeliosCreate->DirectOptimalScanout)))
       imageInfo.layout = OptimizeLayout(imageInfo.usage);
 
     // Check if we can actually create the image

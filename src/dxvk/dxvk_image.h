@@ -92,6 +92,11 @@ namespace dxvk {
     // host can scan out the same backing allocation directly.
     VkBool32 heliosDirectOptimalScanout = VK_FALSE;
 
+    // KMD-created D3DKMDT_GDISURFACE_TEXTURE. The image is an OPTIMAL,
+    // DMA_BUF-backed cross-context allocation and must be imported directly,
+    // never reinterpreted as a pitched GDI staging buffer.
+    VkBool32 heliosCrossContextOptimal = VK_FALSE;
+
     // Helios: direct import of the KMD-owned plain-LINEAR VidPn primary. This
     // is a transfer destination, not a sampled GDI surface: keep its LINEAR
     // image bound directly to the imported resource and bypass staging.
