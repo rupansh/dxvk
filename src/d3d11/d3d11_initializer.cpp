@@ -479,6 +479,15 @@ namespace dxvk {
     if (pResource->HasImage()) {
       ExecuteFlush();
 
+      // NOTE (ROADMAP WS1 defect 0w): ExecuteFlush only INJECTS the flush
+      // chunk, it does not wait for the CS thread, so whether this wait
+      // observes the image as in-use is a race with that thread. It used to
+      // deadlock whenever the CS thread won, because the QFOT re-acquire in
+      // DxvkContext::acquireSharedImagesFromExternal claimed Write on a
+      // still-open command list — see the comment there. To re-provoke that
+      // race deterministically for a regression test, sleep here between the
+      // flush and the wait; a 150 ms sleep made it fire on the first
+      // iteration, where 35 unassisted attempts had produced none.
       m_device->waitForResource(*pResource->GetImage(), DxvkAccess::Write);
     }
 

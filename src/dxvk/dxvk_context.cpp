@@ -10144,7 +10144,15 @@ namespace dxvk {
       barrier.subresourceRange = image->getAvailableSubresources();
 
       m_execBarriers.addImageBarrier(barrier);
-      m_cmd->track(image, DxvkAccess::Write);
+
+      // Lifetime reference only, for the same reason as the matching acquire
+      // in acquireSharedImagesFromExternal: an ownership transfer is not a
+      // content write. This side is not a deadlock source on its own (it runs
+      // in endCurrentCommands, so the list it references is submitted
+      // immediately and the reference is released when that list retires), but
+      // the two must agree — an asymmetric pair is what a later reader would
+      // "fix" back into the bug.
+      m_cmd->track(image);
 
       Logger::debug(str::format("DxvkContext: released shared image to EXTERNAL: ",
         std::hex, reinterpret_cast<uintptr_t>(image->handle())));
@@ -10202,7 +10210,32 @@ namespace dxvk {
       barrier.subresourceRange = image->getAvailableSubresources();
 
       m_execBarriers.addImageBarrier(barrier);
-      m_cmd->track(image, DxvkAccess::Write);
+
+      // Lifetime reference ONLY — deliberately NOT DxvkAccess::Write.
+      //
+      // This barrier is a queue-family ownership transfer; it does not write
+      // image contents. track(obj, access) records access "for the purpose of
+      // CPU access synchronisation" (dxvk_cmdlist.h), i.e. it is exactly what
+      // DxvkDevice::waitForResource tests — so claiming Write here told every
+      // CPU waiter that a brand-new command list was writing the image.
+      //
+      // That was ROADMAP WS1 defect 0w. This re-acquire runs at the START of
+      // each command list, so the reference was held by a list that was still
+      // OPEN. A caller that then waited for the image to be free
+      // (D3D11Initializer::SyncSharedTexture -> waitForResource) could only be
+      // released by that list being submitted — but the only thread that would
+      // submit it was the one now blocked in the wait. On an idle XAML startup
+      // that is a permanent deadlock: the Start menu's UI thread parked here
+      // forever and its window was never created. Proven live with an
+      // instrumented build: QFOT-ACQ res=X inUseWrite=1, then WFR-ENTRY res=X
+      // inUse=1, then the loud unsatisfiable-wait check in waitForResource.
+      //
+      // The image must still outlive the list (the barrier references
+      // image->handle()), which is what the access-less overload gives:
+      // DxvkObjectRef holds a strong Rc released when the list retires.
+      // Genuine content accesses recorded into this list still track
+      // Read/Write normally, so waitForResource keeps its real meaning.
+      m_cmd->track(image);
 
       Logger::debug(str::format("DxvkContext: acquired shared image from EXTERNAL: ",
         std::hex, reinterpret_cast<uintptr_t>(image->handle())));
