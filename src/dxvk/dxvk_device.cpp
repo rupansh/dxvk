@@ -6,7 +6,13 @@
 #include "dxvk_shader_ir.h"
 
 namespace dxvk {
-  
+
+  /// HELIOS: how many times a waitForResource could never have returned (see
+  /// the loud check in waitForResource). Expected 0. Process-wide rather than
+  /// per-device: the condition is a driver bug, not a property of one device,
+  /// and the count belongs next to the message that reports it.
+  static std::atomic<uint32_t> s_unsatisfiableWaits = { 0u };
+
   DxvkDevice::DxvkDevice(
     const Rc<DxvkInstance>&         instance,
     const Rc<DxvkAdapter>&          adapter,
@@ -674,15 +680,48 @@ namespace dxvk {
   void DxvkDevice::waitForResource(const DxvkPagedResource& resource, DxvkAccess access) {
     if (resource.isInUse(access)) {
       auto t0 = dxvk::high_resolution_clock::now();
+      bool reportedStuck = false;
 
       // HELIOS: bail out once the device is lost — after loss nothing is
       // guaranteed to release the resource's usage refs, and an unbounded
       // wait here wedges the calling thread for the life of the process
       // (2026-07-05: dwm compositor stuck in Map for 25+ minutes). Mapped
       // contents are undefined on a lost device anyway.
-      m_submissionQueue.synchronizeUntil([this, &resource, access] {
-        return !resource.isInUse(access)
-            || m_submissionQueue.getLastError() == VK_ERROR_DEVICE_LOST;
+      m_submissionQueue.synchronizeUntil([this, &resource, access, &reportedStuck] {
+        if (!resource.isInUse(access)
+         || m_submissionQueue.getLastError() == VK_ERROR_DEVICE_LOST)
+          return true;
+
+        // HELIOS: name the unsatisfiable wait instead of hanging silently.
+        // Both submission stages empty means nothing is queued and nothing is
+        // in flight, so no completion can ever release this reference and
+        // m_finishCond will not be signalled again — this wait can never
+        // return. That is exactly how ROADMAP WS1 defect 0w presented: the
+        // Start menu's XAML thread parked here forever inside
+        // D3D11Initializer::SyncSharedTexture, its texture still carrying one
+        // write reference held by a command list that was never submitted,
+        // while every DXVK worker sat idle. Diagnosed only by minidumping the
+        // process and decoding m_useCount by hand; this line makes the next
+        // occurrence say so itself.
+        //
+        // Deliberately does NOT change behaviour — bounding the wait would
+        // return with the reference still leaked and hand the caller a
+        // resource whose pending work never completed. The fix belongs at the
+        // site that leaks the reference.
+        if (m_submissionQueue.isDrainedLocked() && !reportedStuck) {
+          reportedStuck = true;
+
+          Logger::err(str::format(
+            "DxvkDevice: UNSATISFIABLE waitForResource: resource ", &resource,
+            " still in use (read=", resource.isInUse(DxvkAccess::Read),
+            " write=", resource.isInUse(DxvkAccess::Write),
+            " trackId=", resource.getTrackId(),
+            ") with the submission queue fully drained. The reference is held by a "
+            "command list that was never submitted; this wait cannot return. "
+            "occurrences=", s_unsatisfiableWaits.fetch_add(1u) + 1u));
+        }
+
+        return false;
       });
 
       if (resource.isInUse(access))

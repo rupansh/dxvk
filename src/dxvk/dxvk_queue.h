@@ -172,6 +172,23 @@ namespace dxvk {
     }
 
     /**
+     * \brief Whether both submission stages are empty
+     *
+     * HELIOS. Nothing is queued for submission and nothing is in flight, so
+     * no further completion can occur and \ref m_finishCond will not be
+     * signalled again by this queue. MUST be called with \ref m_mutex already
+     * held — the only legal caller is a \ref synchronizeUntil predicate, which
+     * holds it. Taking the lock here instead would self-deadlock.
+     *
+     * A waiter that observes "resource still in use" together with this
+     * returning \c true is waiting on a reference that nothing will ever
+     * release; see the loud check in DxvkDevice::waitForResource.
+     */
+    bool isDrainedLocked() const {
+      return m_submitQueue.empty() && m_finishQueue.empty();
+    }
+
+    /**
      * \brief Waits for all submissions to complete
      */
     void waitForIdle();
