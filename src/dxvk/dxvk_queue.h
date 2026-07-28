@@ -181,8 +181,9 @@ namespace dxvk {
      * holds it. Taking the lock here instead would self-deadlock.
      *
      * A waiter that observes "resource still in use" together with this
-     * returning \c true is waiting on a reference that nothing will ever
-     * release; see the loud check in DxvkDevice::waitForResource.
+     * returning \c true is waiting on a reference held by a command list that
+     * has not been submitted. That is terminal only if no other thread will
+     * submit it; see the loud check in DxvkDevice::waitForResource.
      */
     bool isDrainedLocked() const {
       return m_submitQueue.empty() && m_finishQueue.empty();

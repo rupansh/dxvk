@@ -7,10 +7,13 @@
 
 namespace dxvk {
 
-  /// HELIOS: how many times a waitForResource could never have returned (see
-  /// the loud check in waitForResource). Expected 0. Process-wide rather than
-  /// per-device: the condition is a driver bug, not a property of one device,
-  /// and the count belongs next to the message that reports it.
+  /// HELIOS: how many times a waitForResource stalled with the submission
+  /// queue fully drained (see the loud check in waitForResource). Not
+  /// necessarily fatal — a multi-threaded caller can still be rescued by
+  /// another thread submitting the holding command list, and dwm trips this
+  /// once per start — so read it as a rate, not as a pass/fail. Process-wide
+  /// rather than per-device: the condition is about command-list submission,
+  /// not a property of one device.
   static std::atomic<uint32_t> s_unsatisfiableWaits = { 0u };
 
   DxvkDevice::DxvkDevice(
@@ -692,33 +695,41 @@ namespace dxvk {
          || m_submissionQueue.getLastError() == VK_ERROR_DEVICE_LOST)
           return true;
 
-        // HELIOS: name the unsatisfiable wait instead of hanging silently.
-        // Both submission stages empty means nothing is queued and nothing is
-        // in flight, so no completion can ever release this reference and
-        // m_finishCond will not be signalled again — this wait can never
-        // return. That is exactly how ROADMAP WS1 defect 0w presented: the
-        // Start menu's XAML thread parked here forever inside
-        // D3D11Initializer::SyncSharedTexture, its texture still carrying one
-        // write reference held by a command list that was never submitted,
-        // while every DXVK worker sat idle. Diagnosed only by minidumping the
-        // process and decoding m_useCount by hand; this line makes the next
-        // occurrence say so itself.
+        // HELIOS: name the stalled wait instead of hanging silently. Both
+        // submission stages empty means nothing is queued and nothing is in
+        // flight, so no completion can come from this queue as things stand,
+        // and the reference must be held by a command list that has not been
+        // submitted.
+        //
+        // Whether that is terminal depends on who else can submit it:
+        //  - single-threaded caller  -> terminal. ROADMAP WS1 defect 0w: the
+        //    Start menu's XAML thread parked here forever inside
+        //    D3D11Initializer::SyncSharedTexture and the only thread that
+        //    could have submitted the holding list was the blocked one.
+        //    Diagnosed only by minidumping the process and decoding
+        //    m_useCount by hand; this line makes the next one say so itself.
+        //  - multi-threaded caller   -> often transient. dwm trips this once
+        //    per start and recovers, because another of its threads submits
+        //    the list and releases the reference.
+        // So this is a loud warning, NOT a proof of deadlock. A repeating or
+        // never-cleared occurrence is the one that matters.
         //
         // Deliberately does NOT change behaviour — bounding the wait would
-        // return with the reference still leaked and hand the caller a
-        // resource whose pending work never completed. The fix belongs at the
-        // site that leaks the reference.
+        // return with the reference still held and hand the caller a resource
+        // whose pending work never completed. The fix belongs at the site that
+        // holds the reference.
         if (m_submissionQueue.isDrainedLocked() && !reportedStuck) {
           reportedStuck = true;
 
           Logger::err(str::format(
-            "DxvkDevice: UNSATISFIABLE waitForResource: resource ", &resource,
+            "DxvkDevice: waitForResource STALLED: resource ", &resource,
             " still in use (read=", resource.isInUse(DxvkAccess::Read),
             " write=", resource.isInUse(DxvkAccess::Write),
             " trackId=", resource.getTrackId(),
-            ") with the submission queue fully drained. The reference is held by a "
-            "command list that was never submitted; this wait cannot return. "
-            "occurrences=", s_unsatisfiableWaits.fetch_add(1u) + 1u));
+            ") with the submission queue fully drained. Nothing pending can release "
+            "it; unless another thread submits the command list holding it, this "
+            "wait cannot return. occurrences=",
+            s_unsatisfiableWaits.fetch_add(1u) + 1u));
         }
 
         return false;
