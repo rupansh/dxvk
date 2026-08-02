@@ -131,6 +131,23 @@ namespace dxvk {
     bool HeliosWaitFrameComplete(uint64_t TimeoutUs);
 
     /**
+     * \brief Helios: waits until the current frame has been SUBMITTED
+     *
+     * The present-ordering handshake the KMD actually requires: flush, wait for
+     * the CS thread to record the flush chunk, then wait for the submission
+     * thread to perform the vkQueueSubmit. After this returns, every Venus
+     * command of the frame has reached the wire and been given a fence, so the
+     * watermark DxgkDdiRender samples covers the frame and the KMD holds the
+     * scanout refresh until those fences retire.
+     *
+     * This is strictly weaker -- and far cheaper -- than
+     * \ref HeliosWaitFrameComplete, which waits for GPU completion and thereby
+     * removes all CPU/GPU overlap. It takes no timeout because it waits only on
+     * guest CPU threads; there is no slow-GPU case to bound.
+     */
+    void HeliosWaitFrameSubmitted();
+
+    /**
      * \brief Helios: record a present-fence signal on the open command list
      *
      * Emits a timeline-semaphore signal that rides the CURRENT recording
@@ -158,6 +175,26 @@ namespace dxvk {
      * exactly what orders this copy against the producing ICD's GPU writes.
      */
     void HeliosCopyExternalFrame(
+      const Rc<DxvkImage>&        DstImage,
+      const Rc<DxvkImage>&        SrcImage,
+            VkExtent3D            Extent);
+
+    /**
+     * \brief Helios: ordered snapshot copy for the D4b scanout ring
+     *
+     * Records a full-subresource copyImage of the presented primary into a
+     * snapshot-ring image on the open command list, at present position, so
+     * the copy rides the frame's own command stream: it executes after the
+     * frame's draws and before anything of frame N+1 (queue order — no waits,
+     * no stalls). A full-extent OPTIMAL->OPTIMAL same-format copy takes
+     * DxvkContext::copyImageHw, which handles the layout transitions
+     * internally, and the copy-time consumer present-wait no-ops for
+     * non-import sources, so no consumer wait is armed here. The destination
+     * is a scanout-flagged image, so heliosEmitScanoutReuseWaits gates this
+     * list on any still-in-flight host readback of the slot (the D4a acquire
+     * as the snapshot-overwrite backstop).
+     */
+    void HeliosCopyPresentSnapshot(
       const Rc<DxvkImage>&        DstImage,
       const Rc<DxvkImage>&        SrcImage,
             VkExtent3D            Extent);

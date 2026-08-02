@@ -954,6 +954,45 @@ namespace dxvk {
   }
 
 
+  void D3D11ImmediateContext::HeliosWaitFrameSubmitted() {
+    uint64_t sequenceNumber;
+
+    {
+      D3D10DeviceLock lock = LockContext();
+
+      // Dispatch + submit whatever the app recorded for this frame. With
+      // nothing pending this is a no-op and the sequence number names the last
+      // dispatched chunk, which is then exactly what we wait for.
+      ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, false);
+      sequenceNumber = GetCurrentSequenceNumber();
+    }
+
+    // Two asynchronous stages sit between this thread and the Venus wire, and
+    // the KMD's watermark can only order what has already reached it:
+    //
+    //   1. the CS thread still has to execute the flush chunk, which is what
+    //      calls DxvkContext::flushCommandList;
+    //   2. the submission thread still has to perform the vkQueueSubmit, which
+    //      is where the ICD escapes the command stream and the KMD allocates
+    //      the wire fence.
+    //
+    // Waiting for both is the ENTIRE ordering requirement. DxgkDdiRender then
+    // samples a watermark that covers this frame, and the KMD holds the scanout
+    // refresh GPU-side until those fences retire. Waiting for the submission
+    // FENCE instead -- what HeliosWaitFrameComplete does -- additionally waits
+    // out the GPU, which serialises CPU and GPU into one frame time and is a
+    // full frame of throughput the ordering never needed.
+    //
+    // Unbounded on purpose: this waits on two guest CPU threads, not on the
+    // GPU, so it has no "the frame is just slow" failure mode to escape from.
+    // Back-pressure still exists -- DxvkSubmissionQueue::submit blocks once
+    // MaxNumQueuedCommandBuffers are in flight -- and that is the frames-in-
+    // flight limiter every DXVK app already runs with.
+    SynchronizeCsThread(sequenceNumber);
+    m_device->syncSubmissions();
+  }
+
+
   void D3D11ImmediateContext::HeliosSignalPresentFence(
     const Rc<DxvkFence>&        Fence,
           uint64_t              Value) {
@@ -969,6 +1008,27 @@ namespace dxvk {
 
 
   void D3D11ImmediateContext::HeliosCopyExternalFrame(
+    const Rc<DxvkImage>&        DstImage,
+    const Rc<DxvkImage>&        SrcImage,
+          VkExtent3D            Extent) {
+    D3D10DeviceLock lock = LockContext();
+
+    EmitCs([
+      cDstImage = DstImage,
+      cSrcImage = SrcImage,
+      cExtent   = Extent
+    ] (DxvkContext* ctx) {
+      const VkImageSubresourceLayers layers =
+        { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
+      ctx->copyImage(
+        cDstImage, layers, VkOffset3D { 0, 0, 0 },
+        cSrcImage, layers, VkOffset3D { 0, 0, 0 },
+        cExtent);
+    });
+  }
+
+
+  void D3D11ImmediateContext::HeliosCopyPresentSnapshot(
     const Rc<DxvkImage>&        DstImage,
     const Rc<DxvkImage>&        SrcImage,
           VkExtent3D            Extent) {

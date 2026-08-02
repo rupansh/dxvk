@@ -1451,6 +1451,52 @@ namespace dxvk {
       uint32_t      retryCountdown = 0u;
     };
     std::unordered_map<uint64_t, HeliosPresentWaitFence> m_heliosPresentWaitFences;
+
+    /* Helios cross-process present ordering, CONSUMER side. Venus resource ids
+     * of imported surfaces this command list samples, deduplicated; drained at
+     * flush into GPU-side timeline waits on the producers' named present
+     * fences. The whole point is that neither side blocks a CPU thread: the
+     * producer records a signal at its frame's GPU completion and publishes the
+     * value, and this turns that into a wait the GPU resolves. The alternative
+     * this replaces -- the producer CPU-blocking on its own GPU completion
+     * before publishing the present -- cost Fire Strike GT1 158 -> 136 fps and
+     * Combined 25.9 -> 18.8 fps, because it removed all CPU/GPU overlap. */
+    std::vector<uint32_t>                     m_heliosImportedReads;
+    /* Last value already waited for per (pid << 32 | fenceId). A timeline wait
+     * on an already-reached value is nearly free, but skipping it keeps the
+     * submission's wait list short when dwm composes many windows fed by one
+     * producer. */
+    std::unordered_map<uint64_t, uint64_t>    m_heliosImportedWaited;
+    uint64_t                                  m_heliosImportedWaitsEmitted = 0u;
+
+    /* Helios D4a scanout-read acquire, consumer side: last ledger `issued`
+     * this submission chain armed per venus resid. Same argument as
+     * m_heliosImportedWaited — an earlier submission on this queue waiting
+     * >= issued queue-orders every later one, so re-arming would only pad
+     * the wait list. Plus the census counters §7.1's predictions score
+     * (armed/(armed+skipped) is the conditional-wait rate; residMiss and
+     * ledgerMiss split "armed ~= 0" into identity-path vs no-slot causes). */
+    std::unordered_map<uint32_t, uint64_t>    m_heliosScanoutWaited;
+    uint64_t                                  m_heliosScanoutFlushes    = 0u;
+    uint64_t                                  m_heliosScanoutArmed      = 0u;
+    uint64_t                                  m_heliosScanoutSkipped    = 0u;
+    uint64_t                                  m_heliosScanoutLedgerMiss = 0u;
+    uint64_t                                  m_heliosScanoutResidMiss  = 0u;
+    /* Sampled imported surfaces with NO publish slot: an UNORDERED read, i.e.
+     * exactly the defect this mechanism exists to close. Must fall to zero for
+     * app windows once the producer side is wired; a nonzero steady state names
+     * a producer that is not publishing. */
+    uint64_t                                  m_heliosImportedNoSlot       = 0u;
+    /* Sampled SHARED images by sharing mode, and how many Import-mode ones
+     * carried no venus resource id. Without this, "no waits were emitted" has
+     * three indistinguishable causes: the seam is not reached, the consumer
+     * samples nothing shared, or it samples shared images that are not
+     * Import-mode. Cheap (one increment per already-rare branch) and it is the
+     * only way to tell those apart on a live desktop. */
+    uint64_t                                  m_heliosSampledImport        = 0u;
+    uint64_t                                  m_heliosSampledExport        = 0u;
+    uint64_t                                  m_heliosSampledNoResid       = 0u;
+    uint64_t                                  m_heliosFlushes              = 0u;
     uint64_t                                  m_heliosPresentWaits        = 0u;
     uint64_t                                  m_heliosPresentWaitUsTotal  = 0u;
     uint64_t                                  m_heliosPresentWaitTimeouts = 0u;
@@ -2041,6 +2087,13 @@ namespace dxvk {
     void heliosPresentWaitBeforeRefresh(
       const Rc<DxvkImage>&      image);
 
+    void heliosNoteSampledShared(
+            DxvkImage*          image);
+
+    void heliosEmitImportedWaits();
+
+    void heliosEmitScanoutReuseWaits();
+
     DxvkFence* heliosProducerFence(
             uint32_t            pid,
             uint32_t            fenceId);
@@ -2366,6 +2419,17 @@ namespace dxvk {
       DxvkAccess access = IsWritable && (binding.getAccess() & vk::AccessWriteMask)
         ? DxvkAccess::Write : DxvkAccess::Read;
       m_cmd->track(view.image(), access);
+
+      // Helios cross-process present ordering. This is the seam because it is
+      // the one funnel every SAMPLED bound image passes through, on BOTH
+      // binding models (updateDescriptorSetsBindings and
+      // updateDescriptorHeapBindings), and it is re-run per command list, so a
+      // binding dwm leaves in place across frames is still seen. The copy-time
+      // wait in heliosPresentWaitBeforeRefresh does NOT cover this: dwm
+      // composes an app window by sampling the shared surface, never by
+      // copying it, which is why that path had not logged a single line.
+      if (unlikely(view.image()->info().sharing.mode != DxvkSharedHandleMode::None))
+        heliosNoteSampledShared(view.image());
     }
 
     bool formatsAreImageCopyCompatible(

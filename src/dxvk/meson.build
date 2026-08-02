@@ -46,6 +46,7 @@ dxvk_src = [
   'dxvk_device_info.cpp',
   'dxvk_fence.cpp',
   'dxvk_helios_present_sync.cpp',
+  'dxvk_helios_scanout_acquire.cpp',
   'dxvk_format.cpp',
   'dxvk_framebuffer.cpp',
   'dxvk_gpu_event.cpp',

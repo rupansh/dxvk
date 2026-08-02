@@ -8,6 +8,7 @@
 #include "dxvk_fence.h"
 #include "dxvk_framebuffer.h"
 #include "dxvk_hang.h"
+#include "dxvk_helios_scanout_acquire.h"
 #include "dxvk_image.h"
 #include "dxvk_instance.h"
 #include "dxvk_latency.h"
@@ -150,6 +151,18 @@ namespace dxvk {
      */
     const DxvkOptions& config() const {
       return m_options;
+    }
+
+    /**
+     * \brief Helios D4a scanout-read acquire state
+     *
+     * The per-device gate fences + signaler thread that order a scan-out
+     * buffer's re-write after every in-flight host readback of it. The
+     * context's flush path arms waits through it; ~DxvkDevice shuts it
+     * down before waitForIdle.
+     */
+    DxvkHeliosScanoutAcquire& heliosScanoutAcquire() {
+      return m_heliosScanoutAcquire;
     }
     
     /**
@@ -675,8 +688,24 @@ namespace dxvk {
             DxvkSubmitStatus*         status);
 
     /**
+     * \brief Helios: waits until queued command lists have been submitted
+     *
+     * Blocks until the submission thread has drained everything queued so far,
+     * i.e. every pending command list has actually reached \c vkQueueSubmit.
+     * On Helios that call is where the Venus ICD escapes the command stream and
+     * the KMD allocates the matching wire fence, so this is the point at which
+     * the frame becomes visible to the KMD's scanout watermark.
+     *
+     * Distinct from waiting on the submission FENCE, which signals at GPU
+     * completion and is therefore a full pipeline drain.
+     */
+    void syncSubmissions() {
+      m_submissionQueue.synchronize();
+    }
+
+    /**
      * \brief Locks submission queue
-     * 
+     *
      * Since Vulkan queues are only meant to be accessed
      * from one thread at a time, external libraries need
      * to lock the queue before submitting command buffers.
@@ -771,6 +800,8 @@ namespace dxvk {
     DxvkRecycler<DxvkCommandList, 16> m_recycledCommandLists;
 
     DxvkSubmissionQueue         m_submissionQueue;
+
+    DxvkHeliosScanoutAcquire    m_heliosScanoutAcquire;
 
     Rc<DxvkShaderCache>         m_shaderCache;
 

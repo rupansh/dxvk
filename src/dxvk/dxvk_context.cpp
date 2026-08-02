@@ -143,6 +143,11 @@ namespace dxvk {
   void DxvkContext::flushCommandList(
     const VkDebugUtilsLabelEXT*       reason,
           DxvkSubmitStatus*           status) {
+    // Helios cross-process present ordering: turn the imported surfaces this
+    // list sampled into GPU-side timeline waits on their producers' frames.
+    // Must precede endRecording so the waits ride THIS submission.
+    heliosEmitImportedWaits();
+
     // If necessary, block any async queue on previous command completion
     if (m_submitWaitId)
       m_cmd->waitFence(m_trackingFence, std::exchange(m_submitWaitId, 0ull));
@@ -9322,6 +9327,14 @@ namespace dxvk {
 
     prepareSharedImages();
 
+    // Helios D4a: MUST run after prepareSharedImages() (which force-flushes a
+    // shared image's deferred clear into accessImage → trackSharedImageTouched
+    // — the clear-only next-frame list is exactly the case the gate exists
+    // for) and before releaseSharedImagesToExternal() consumes and clears
+    // m_sharedImagesTouched. The armed waits land on THIS list's first
+    // vkQueueSubmit2.
+    heliosEmitScanoutReuseWaits();
+
     releaseSharedImagesToExternal();
 
     m_sdmaAcquires.finalize(m_cmd);
@@ -9595,6 +9608,103 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::heliosNoteSampledShared(DxvkImage* image) {
+    const auto& sharing = image->info().sharing;
+
+    if (sharing.mode == DxvkSharedHandleMode::Export) {
+      m_heliosSampledExport += 1u;
+      return;
+    }
+
+    m_heliosSampledImport += 1u;
+
+    const uint32_t resid = sharing.heliosResourceId;
+
+    if (!resid) {
+      // Imported through a HANDLE rather than by venus resource id, so there is
+      // no key to look a publish slot up by. Counted: it would otherwise look
+      // identical to "nothing shared was sampled".
+      m_heliosSampledNoResid += 1u;
+      return;
+    }
+
+    // Linear scan: the list is the set of imported surfaces sampled by ONE
+    // command list, i.e. the visible app windows dwm is compositing. A hash set
+    // would cost more than the scan at that size.
+    for (uint32_t known : m_heliosImportedReads) {
+      if (known == resid)
+        return;
+    }
+
+    m_heliosImportedReads.push_back(resid);
+  }
+
+
+  void DxvkContext::heliosEmitImportedWaits() {
+    // Cadence lives here, not behind the early-out: "no waits emitted" is a
+    // result that has to be reportable, and it is the one this instrument was
+    // added to explain.
+    m_heliosFlushes += 1u;
+
+    if ((m_heliosFlushes % 1024u) == 1u) {
+      Logger::info(str::format("present-order: flushes=", m_heliosFlushes,
+        " sampled_import=", m_heliosSampledImport,
+        " sampled_export=", m_heliosSampledExport,
+        " import_no_resid=", m_heliosSampledNoResid,
+        " gpu_waits=", m_heliosImportedWaitsEmitted,
+        " noslot=", m_heliosImportedNoSlot,
+        " producers=", m_heliosImportedWaited.size()));
+    }
+
+    if (m_heliosImportedReads.empty())
+      return;
+
+    for (uint32_t resid : m_heliosImportedReads) {
+      uint32_t pid = 0u;
+      uint32_t fenceId = 0u;
+      uint64_t value = 0u;
+
+      if (!HeliosPresentSync::lookup(resid, &pid, &fenceId, &value)) {
+        // No slot = this producer publishes nothing, so its surface is read
+        // UNORDERED. Loud rather than silent: a steady nonzero count here is
+        // the black-frame defect, named.
+        m_heliosImportedNoSlot += 1u;
+
+        if ((m_heliosImportedNoSlot % 512u) == 1u) {
+          Logger::info(str::format("present-order: sampled imported surface with no slot: ",
+            m_heliosImportedNoSlot, " (resid ", resid, ")"));
+        }
+
+        continue;
+      }
+
+      DxvkFence* fence = heliosProducerFence(pid, fenceId);
+
+      if (fence == nullptr)
+        continue;
+
+      // Skip a value this submission chain has already waited past. Correct
+      // because timeline values only advance: an earlier submission waiting for
+      // >= value is ordered ahead of this one on the same queue.
+      const uint64_t key = (uint64_t(pid) << 32) | fenceId;
+      uint64_t& waited = m_heliosImportedWaited[key];
+
+      if (waited >= value)
+        continue;
+
+      waited = value;
+
+      // The GPU-side wait. Unlike a CPU wait this costs the calling thread
+      // nothing: the queue blocks until the producer's frame completes, and the
+      // CPU carries on recording.
+      m_cmd->waitFence(Rc<DxvkFence>(fence), value);
+      m_heliosImportedWaitsEmitted += 1u;
+    }
+
+    m_heliosImportedReads.clear();
+  }
+
+
   DxvkFence* DxvkContext::heliosProducerFence(uint32_t pid, uint32_t fenceId) {
     // Keyed by (pid, fenceId): one producer process owns several D3D11
     // devices, each with its own named fence; a recreated device in the
@@ -9635,6 +9745,122 @@ namespace dxvk {
     }
 
     return entry.fence.ptr();
+  }
+
+
+  void DxvkContext::heliosEmitScanoutReuseWaits() {
+    // D4a scanout-read acquire (FIX-DESIGN-d4a.md §5.1). For every scan-out
+    // buffer this command list re-wrote, ask the KMD's read ledger whether a
+    // host readback of THAT buffer is still in flight; if so, gate this
+    // list's execution on its retirement with a TOP_OF_PIPE timeline wait on
+    // the list's first vkQueueSubmit2. The wait parks the host GPU queue
+    // (per-queue vkr sync thread), never a guest CPU thread — the ordering
+    // real WDDM flip-model performs via the scheduler, which is what keeps
+    // it on the right side of the deleted-CPU-present-gate directive.
+    //
+    // The knob-off / probe-failed / standalone-build fast path is this one
+    // check: the resolver latches and the UMD export is a single atomic load.
+    if (!helios_acquire::enabled())
+      return;
+
+    // Cadence outside the per-image work: "no waits armed" is a result the
+    // census exists to explain (prediction §7.1 — GT2 armed ≈ 0 means the
+    // emission point or the identity path is wrong, not success).
+    m_heliosScanoutFlushes += 1u;
+
+    // Steady-state cadence (0ab-C close-out): one census line per ~16k
+    // flushes — a couple of lines per benchmark run — instead of the per-1024
+    // bring-up chatter. The counters themselves stay exact.
+    if ((m_heliosScanoutFlushes % 16384u) == 1u) {
+      auto& acquire = m_device->heliosScanoutAcquire();
+      Logger::info(str::format("helios-acquire: armed=", m_heliosScanoutArmed,
+        " skipped=", m_heliosScanoutSkipped,
+        " signals=", acquire.signalCount(),
+        " maxArmToSigUs=", acquire.maxArmToSigUs(),
+        " ledgerMiss=", m_heliosScanoutLedgerMiss,
+        " residMiss=", m_heliosScanoutResidMiss,
+        " signalFails=", acquire.signalFailCount(),
+        " createFails=", acquire.createFailCount()));
+    }
+
+    for (const auto& image : m_sharedImagesTouched) {
+      const auto& info = image->info();
+
+      // Only images the host can read back: the direct-OPTIMAL primary, the
+      // exact-primary LINEAR shape, and the KMD-owned LINEAR fallback target.
+      // dwm's compositing SRVs and ordinary backbuffers never qualify.
+      if (!info.heliosDirectOptimalScanout
+       && !info.heliosScanoutPrimary
+       && !info.heliosLinearScanoutTarget)
+        continue;
+
+      // Identity from the STORAGE, never info().sharing.heliosResourceId:
+      // rotate_resource_backings swaps storages between images, so the
+      // create-time id goes stale while the storage's backing memory is
+      // authoritative (the 56th-session lesson, restated by the spec §5.1).
+      Rc<DxvkResourceAllocation> storage = image->storage();
+
+      if (storage == nullptr)
+        continue;
+
+      const uint32_t resid = helios_acquire::residFromMemory(
+        storage->getMemoryInfo().memory);
+
+      if (!resid) {
+        m_heliosScanoutResidMiss += 1u;
+        continue;
+      }
+
+      uint32_t issued = 0u;
+      uint32_t retired = 0u;
+
+      if (!helios_acquire::ledgerLookup(resid, &issued, &retired)) {
+        // No slot: the KMD never issued a readback of this buffer (or the
+        // 8-slot table overflowed, counted KMD-side as RdOvf), so there is
+        // nothing to order against — today's behavior, loudly.
+        m_heliosScanoutLedgerMiss += 1u;
+        continue;
+      }
+
+      // issued <= retired = no read in flight. (A torn read pair can only
+      // understate issued — the KMD bumps issued before retired — which
+      // errs toward not waiting on a read that just retired: correct.)
+      if (issued <= retired) {
+        m_heliosScanoutSkipped += 1u;
+        continue;
+      }
+
+      // Skip a value this submission chain already waited past — an earlier
+      // list on the same queue waiting >= issued orders this one too
+      // (m_heliosImportedWaited's argument, per-resid).
+      uint64_t& waited = m_heliosScanoutWaited[resid];
+
+      if (waited >= uint64_t(issued)) {
+        m_heliosScanoutSkipped += 1u;
+        continue;
+      }
+
+      Rc<DxvkFence> fence = m_device->heliosScanoutAcquire()
+        .armFence(resid, issued, retired);
+
+      if (fence == nullptr) {
+        // Shutdown or fence-creation failure (counted device-side): run
+        // ungated rather than stall or throw.
+        m_heliosScanoutSkipped += 1u;
+        continue;
+      }
+
+      waited = uint64_t(issued);
+
+      // The conditional GPU-side wait. waitFence's getValue() elision reads
+      // the venus feedback slot (cheap, guest-side); an unelided wait rides
+      // this list — which by construction carries the frame's own command
+      // buffers (the touched set implies recorded work), so the venus
+      // wait-only submission fold can never see it (landmine #2), and no
+      // sync-only batch is ever emitted here.
+      m_cmd->waitFence(std::move(fence), uint64_t(issued));
+      m_heliosScanoutArmed += 1u;
+    }
   }
 
 
