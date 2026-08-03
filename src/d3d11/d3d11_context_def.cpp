@@ -152,15 +152,27 @@ namespace dxvk {
     // by the command list are visible to the immediate context.
     ResetCommandListState();
 
-    // Flush any outstanding commands so that
-    // we don't mess up the execution order
-    FlushCsChunk();
-    
-    // Record any chunks from the given command list into the
-    // current command list and deal with context state
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
-    m_chunkId = m_commandList->AddCommandList(commandList);
-    
+
+    // Helios: an empty fast-path list splices nothing (and AddCommandList's
+    // tail arithmetic assumes non-empty lists). The recorded sweep above and
+    // the state reset below still uphold the API's clear-state semantics.
+    if (likely(!commandList->IsEmpty())) {
+      // Flush any outstanding commands so that
+      // we don't mess up the execution order
+      FlushCsChunk();
+
+      // Record any chunks from the given command list into the
+      // current command list and deal with context state
+      m_chunkId = m_commandList->AddCommandList(commandList);
+
+      // Helios: a fast-path list has no trailing sweep, so record the
+      // clean-state restoration it would otherwise have provided — the
+      // recording that follows assumes a clean stream tail.
+      if (unlikely(!commandList->EndsClean()))
+        ResetCommandListState();
+    }
+
     // Restore deferred context state
     if (RestoreContextState)
       RestoreCommandListState();
@@ -177,10 +189,21 @@ namespace dxvk {
     // End all queries that were left active by the app
     FinalizeQueries();
 
-    // Clean up command list state so that the any state changed
-    // by this command list does not affect the calling context.
-    // This also ensures that the command list is never empty.
-    ResetCommandListState();
+    if (likely(heliosClFastPath())) {
+      // Helios: skip the recorded trailing reset sweep — the executing
+      // context re-establishes the clean state with its own per-execute
+      // sweep either way, so recording a second one into every list only
+      // feeds the dxvk-cs thread a constant-cost sweep per list. At the
+      // runtime's BUILD_2 granularity that was 2.66M recorded sweeps per
+      // GT2 run, 85 % of them for lists that were never executed. The list
+      // may now be genuinely empty; every consumer checks IsEmpty().
+      m_commandList->SetEndsClean(false);
+    } else {
+      // Clean up command list state so that the any state changed
+      // by this command list does not affect the calling context.
+      // This also ensures that the command list is never empty.
+      ResetCommandListState();
+    }
 
     // Make sure all commands are visible to the command list
     FlushCsChunk();

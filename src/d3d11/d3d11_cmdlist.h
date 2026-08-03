@@ -43,6 +43,32 @@ namespace dxvk {
             UINT                Subresource,
             uint64_t            ChunkId);
 
+    /**
+     * \brief Whether replaying this list leaves the DXVK context clean
+     *
+     * Helios: stock lists always end with a recorded ResetCommandListState
+     * sweep; lists finished on the CL fast path do not, so the executing
+     * context must account for the leftover state itself.
+     */
+    bool EndsClean() const {
+      return m_heliosEndsClean;
+    }
+
+    void SetEndsClean(bool EndsClean) {
+      m_heliosEndsClean = EndsClean;
+    }
+
+    /**
+     * \brief Whether this list carries no work at all
+     *
+     * Only possible on the CL fast path (a stock list always contains its
+     * trailing reset sweep). Executing an empty list is a no-op apart from
+     * the API-level context-state reset.
+     */
+    bool IsEmpty() const {
+      return m_chunks.empty() && m_queries.empty() && m_resources.empty();
+    }
+
   private:
 
     struct ChunkEntry {
@@ -59,6 +85,8 @@ namespace dxvk {
     };
 
     UINT m_contextFlags = 0u;
+
+    bool m_heliosEndsClean = true;
 
     std::vector<ChunkEntry>             m_chunks;
     std::vector<Com<D3D11Query, false>> m_queries;

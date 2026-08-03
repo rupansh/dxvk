@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <type_traits>
 #include <vector>
 
@@ -25,6 +26,46 @@ namespace dxvk {
 
   class D3D11DeferredContext;
   class D3D11ImmediateContext;
+
+  /**
+   * \brief Helios command-list fast-path kill switch
+   *
+   * Default ON. `HELIOS_DXVK_CL_FAST=0` restores stock behavior: every
+   * FinishCommandList records a trailing reset sweep into the list and
+   * every ExecuteCommandList emits its own reset sweep — the constant
+   * per-command-list costs that swamp the single dxvk-cs consumer at the
+   * D3D11 runtime's BUILD_2 granularity (Phase C measurement,
+   * tmp/handoff-perf-structural/reports/p2-phase-c-outcome.md).
+   */
+  inline bool heliosClFastPath() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_CL_FAST");
+      return !(env && env[0] == '0');
+    }();
+    return enabled;
+  }
+
+  /**
+   * \brief Helios: tail state of the immediate context's emitted CS stream
+   *
+   * Tracks what the last CS-visible operation left the DXVK context's
+   * binding state as, so redundant full reset sweeps can be elided at
+   * command-list boundaries. Stream-relative: this describes the state the
+   * dxvk-cs thread WILL be in once it consumes everything emitted so far,
+   * regardless of how far it has actually gotten.
+   */
+  enum class D3D11HeliosCsState : uint32_t {
+    /// Anything may be bound (normal immediate rendering)
+    Unknown     = 0,
+    /// The last CS-visible operation was a full reset sweep (or a command
+    /// list ending in its recorded trailing sweep) and nothing has been
+    /// emitted since — another sweep would be redundant
+    Clean       = 1,
+    /// The last CS-visible operation was a fast-path command list, which
+    /// carries no trailing sweep: its final bindings are still live on the
+    /// DXVK context and must be swept before any non-execute emission
+    ClLeftover  = 2,
+  };
 
   template<bool IsDeferred>
   struct D3D11ContextObjectForwarder;
@@ -805,6 +846,10 @@ namespace dxvk {
     // staged bind, and clears itself when a scan finds none bound.
     bool                        m_heliosStagedSrvSeen = false;
 
+    // Helios: CS-stream tail state for reset-sweep elision (immediate
+    // contexts only — the deferred instantiation never reads or writes it).
+    D3D11HeliosCsState          m_heliosCsState = D3D11HeliosCsState::Unknown;
+
     DxvkLocalAllocationCache    m_allocationCache;
 
     D3D11ShaderStageState<Rc<DxvkBuffer>> m_instanceData;
@@ -1208,6 +1253,14 @@ namespace dxvk {
 
     template<bool AllowFlush = true, typename Cmd>
     void EmitCs(Cmd&& command) {
+      // Helios: every CS-visible command funnels through here or EmitCsCmd,
+      // so this is where a fast-path command list's leftover bindings get
+      // swept before anything else can observe them.
+      if constexpr (!IsDeferred) {
+        if (unlikely(m_heliosCsState != D3D11HeliosCsState::Unknown))
+          GetTypedContext()->HeliosNoteCsEmit();
+      }
+
       if (unlikely(m_csDataType != D3D11CmdType::None)) {
         m_csData = nullptr;
         m_csDataType = D3D11CmdType::None;
@@ -1226,6 +1279,12 @@ namespace dxvk {
 
     template<typename M, bool AllowFlush = true, typename Cmd>
     void EmitCsCmd(D3D11CmdType type, size_t count, Cmd&& command) {
+      // Helios: see EmitCs — same funnel, same leftover-state sweep.
+      if constexpr (!IsDeferred) {
+        if (unlikely(m_heliosCsState != D3D11HeliosCsState::Unknown))
+          GetTypedContext()->HeliosNoteCsEmit();
+      }
+
       m_csDataType = type;
       m_csData = m_csChunk->pushCmd<M, Cmd>(command, count);
 

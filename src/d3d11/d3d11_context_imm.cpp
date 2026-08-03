@@ -237,39 +237,67 @@ namespace dxvk {
     ResetDirtyTracking();
 
     // Clear state so that the command list can't observe any
-    // current context state. The command list itself will clean
-    // up after execution to ensure that no state changes done
-    // by the command list are visible to the immediate context.
-    ResetCommandListState();
+    // current context state. Helios: elided when the stream tail already is
+    // a full reset sweep — under the runtime's BUILD_2 segmentation this
+    // call arrives hundreds of times back-to-back per frame, and every
+    // sweep after the first is redundant work for the dxvk-cs thread.
+    if (!heliosClFastPath() || m_heliosCsState != D3D11HeliosCsState::Clean)
+      ResetCommandListState();
 
-    // Flush any outstanding commands so that
-    // we don't mess up the execution order
-    FlushCsChunk();
-    
-    // As an optimization, flush everything if the
-    // number of pending draw calls is high enough.
-    ConsiderFlush(GpuFlushType::ImplicitWeakHint);
+    // Helios: an empty fast-path list carries no CS-visible work; only the
+    // API-level context reset below still applies.
+    if (likely(!commandList->IsEmpty())) {
+      // Flush any outstanding commands so that
+      // we don't mess up the execution order
+      FlushCsChunk();
 
-    // Dispatch command list to the CS thread
-    commandList->EmitToCsThread([this] (DxvkCsChunkRef&& chunk, uint64_t cost, GpuFlushType flushType) {
-      EmitCsChunk(std::move(chunk));
+      // As an optimization, flush everything if the
+      // number of pending draw calls is high enough.
+      ConsiderFlush(GpuFlushType::ImplicitWeakHint);
 
-      // Return the sequence number from before the flush since
-      // that is actually going to be needed for resource tracking
-      uint64_t csSeqNum = m_csSeqNum;
+      // Dispatch command list to the CS thread
+      commandList->EmitToCsThread([this] (DxvkCsChunkRef&& chunk, uint64_t cost, GpuFlushType flushType) {
+        EmitCsChunk(std::move(chunk));
 
-      // Consider a flush after every chunk in case the app
-      // submits a very large command list or the GPU is idle
-      AddCost(cost);
-      ConsiderFlush(flushType);
-      return csSeqNum;
-    });
+        // Return the sequence number from before the flush since
+        // that is actually going to be needed for resource tracking
+        uint64_t csSeqNum = m_csSeqNum;
+
+        // Consider a flush after every chunk in case the app
+        // submits a very large command list or the GPU is idle
+        AddCost(cost);
+        ConsiderFlush(flushType);
+        return csSeqNum;
+      });
+
+      // Helios: a stock list restores the clean state itself via its
+      // recorded trailing sweep; a fast-path list leaves its bindings live
+      // on the DXVK context — the next execute's sweep or the EmitCs
+      // funnel accounts for them.
+      m_heliosCsState = commandList->EndsClean()
+        ? D3D11HeliosCsState::Clean
+        : D3D11HeliosCsState::ClLeftover;
+    }
 
     // Restore the immediate context's state
     if (RestoreContextState)
       RestoreCommandListState();
     else
       ResetContextState();
+  }
+
+
+  void D3D11ImmediateContext::HeliosNoteCsEmit() {
+    // A fast-path command list's leftover bindings are still live on the
+    // DXVK context; sweep them before the caller's command is pushed so no
+    // non-execute emission can observe them. Ordering holds because the
+    // sweep is emitted here, ahead of the command that triggered the funnel.
+    // ResetCommandListState itself re-enters the funnel with the state
+    // already Unknown, so there is no recursion.
+    if (m_heliosCsState == D3D11HeliosCsState::ClLeftover)
+      ResetCommandListState();
+
+    m_heliosCsState = D3D11HeliosCsState::Unknown;
   }
   
   

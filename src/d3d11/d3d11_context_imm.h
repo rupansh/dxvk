@@ -307,6 +307,8 @@ namespace dxvk {
 
     void ApplyDirtyNullBindings();
 
+    void HeliosNoteCsEmit();
+
     void ConsiderFlush(
             GpuFlushType                FlushType);
 

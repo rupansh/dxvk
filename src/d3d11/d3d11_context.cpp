@@ -4903,6 +4903,12 @@ namespace dxvk {
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ResetCommandListState() {
+    // Helios: mark the stream Unknown BEFORE emitting so the EmitCs funnel
+    // does not recursively sweep, and Clean after — callers (and the funnel
+    // itself) use Clean to elide back-to-back sweeps.
+    if constexpr (!IsDeferred)
+      m_heliosCsState = D3D11HeliosCsState::Unknown;
+
     EmitCs([
       cUsedBindings  = GetMaxUsedBindings()
     ] (DxvkContext* ctx) {
@@ -4996,6 +5002,9 @@ namespace dxvk {
         }
       }
     });
+
+    if constexpr (!IsDeferred)
+      m_heliosCsState = D3D11HeliosCsState::Clean;
   }
 
 

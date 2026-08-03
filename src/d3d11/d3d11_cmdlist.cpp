@@ -62,6 +62,11 @@ namespace dxvk {
   
   uint64_t D3D11CommandList::AddCommandList(
           D3D11CommandList*   pCommandList) {
+    // Helios: callers skip empty fast-path lists, but keep the tail
+    // arithmetic below well-defined if one slips through anyway.
+    if (unlikely(pCommandList->m_chunks.empty() && m_chunks.empty()))
+      return 0u;
+
     // This will be the chunk ID of the first chunk
     // added, for the purpose of resource tracking.
     uint64_t baseChunkId = m_chunks.size();
