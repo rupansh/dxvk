@@ -7,9 +7,12 @@ namespace dxvk {
     
   D3D11CommandList::D3D11CommandList(
           D3D11Device*  pDevice,
-          UINT          ContextFlags)
+          UINT          ContextFlags,
+          D3D11DeferredContext* pOrigin)
   : D3D11DeviceChild<ID3D11CommandList>(pDevice),
-    m_contextFlags(ContextFlags), m_destructionNotifier(this) { }
+    m_contextFlags(ContextFlags),
+    m_heliosOrigin(pOrigin),
+    m_destructionNotifier(this) { }
   
   
   D3D11CommandList::~D3D11CommandList() {
@@ -46,6 +49,23 @@ namespace dxvk {
   
   UINT STDMETHODCALLTYPE D3D11CommandList::GetContextFlags() {
     return m_contextFlags;
+  }
+
+
+  void D3D11CommandList::ResetForReuse() {
+    // clear(), rather than swap/shrink_to_fit(), releases every payload
+    // reference while retaining the vector allocations for the next list.
+    // In particular this never pins a DxvkCsChunk or staging allocation in
+    // the recycle cache.
+    m_chunks.clear();
+    m_queries.clear();
+    m_resources.clear();
+
+    m_heliosEndsClean = true;
+    m_heliosUsedBindings = { };
+
+    // Context flags and the origin pointer are immutable identity. The cache
+    // never crosses that origin, so neither is recording payload to reset.
   }
   
   
@@ -109,6 +129,34 @@ namespace dxvk {
       // Track resource sequence numbers for the added chunk
       while (j < m_resources.size() && m_resources[j].chunkId == i)
         TrackResourceSequenceNumber(m_resources[j++].ref, seq);
+    }
+  }
+
+
+  D3D11CommandListReplay D3D11CommandList::CreateReplay() {
+    D3D11CommandListReplay result;
+    result.chunks.reserve(m_chunks.size());
+
+    for (const auto& query : m_queries)
+      query->DoDeferredEnd();
+
+    for (const auto& chunk : m_chunks)
+      result.chunks.emplace_back(chunk.chunk);
+
+    return result;
+  }
+
+
+  void D3D11CommandList::TrackResourceSequenceNumbers(uint64_t Seq) {
+    for (const auto& resource : m_resources)
+      TrackResourceSequenceNumber(resource.ref, Seq);
+  }
+
+
+  void D3D11CommandListReplay::operator () (DxvkContext* ctx) {
+    for (auto& chunk : chunks) {
+      chunk->executeAll(ctx);
+      chunk = DxvkCsChunkRef();
     }
   }
   

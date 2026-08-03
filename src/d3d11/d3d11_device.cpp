@@ -64,6 +64,12 @@ namespace dxvk {
     m_initializer = new D3D11Initializer(this);
     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
     m_d3d10Device = new D3D10Device(this, m_context.ptr());
+
+    Logger::info(str::format("Helios CL knobs: fast=", heliosClFastPath() ? 1 : 0,
+      " retain-sampler-refs=", heliosClRetainSamplerRefs() ? 1 : 0,
+      " inline=", heliosClInlineReplay() ? 1 : 0,
+      " bulk-reset=", heliosClBulkStateReset() ? 1 : 0,
+      " stats=", heliosClStats() ? 1 : 0));
   }
   
   
@@ -71,6 +77,26 @@ namespace dxvk {
     delete m_d3d10Device;
     m_context = nullptr;
     delete m_initializer;
+
+    if (heliosClStats()) {
+      const auto load = [] (const std::atomic<uint64_t>& value) {
+        return value.load(std::memory_order_relaxed);
+      };
+
+      const auto& stats = m_heliosCommandListStats;
+
+      Logger::info(str::format(
+        "Helios CL stats: finish(empty/zero/one/multi)=",
+        load(stats.finishedEmpty), "/", load(stats.finishedZeroChunk), "/",
+        load(stats.finishedOneChunk), "/", load(stats.finishedMultiChunk),
+        " execute(empty/zero/one/multi)=",
+        load(stats.executedEmpty), "/", load(stats.executedZeroChunk), "/",
+        load(stats.executedOneChunk), "/", load(stats.executedMultiChunk),
+        " inline(admit/cap-flush)=", load(stats.inlineAdmitted), "/",
+        load(stats.inlineCapFlushes),
+        " bulk(reset/slots)=", load(stats.bulkResetCalls), "/",
+        load(stats.bulkResetSlots)));
+    }
   }
   
   

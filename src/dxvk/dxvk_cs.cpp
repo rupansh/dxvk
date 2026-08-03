@@ -1,6 +1,23 @@
 #include "dxvk_cs.h"
 
+#include <cstdlib>
+
 namespace dxvk {
+
+  namespace {
+
+    // Default to producer sharding in Helios. Setting this to zero selects
+    // only shard zero and reproduces the former single-pool mutex behavior.
+    bool heliosCsPoolSharding() {
+      static const bool enabled = [] {
+        const char* env = std::getenv("HELIOS_DXVK_CS_POOL_SHARDING");
+        return !(env && env[0] == '0');
+      }();
+
+      return enabled;
+    }
+
+  }
   
   DxvkCsChunk::DxvkCsChunk() {
     
@@ -57,25 +74,44 @@ namespace dxvk {
   }
   
   
-  DxvkCsChunkPool::DxvkCsChunkPool() {
-    
-  }
+  DxvkCsChunkPool::DxvkCsChunkPool()
+  : m_shardMask(heliosCsPoolSharding() ? ShardCount - 1u : 0u) { }
   
   
   DxvkCsChunkPool::~DxvkCsChunkPool() {
-    for (DxvkCsChunk* chunk : m_chunks)
-      delete chunk;
+    for (auto& shard : m_shards) {
+      for (DxvkCsChunk* chunk : shard.chunks)
+        delete chunk;
+    }
   }
   
   
-  DxvkCsChunk* DxvkCsChunkPool::allocChunk(DxvkCsChunkFlags flags) {
+  uint32_t DxvkCsChunkPool::pickShard() const {
+    // Keep HELIOS_DXVK_CS_POOL_SHARDING=0 a true single-pool baseline:
+    // do not materialize a thread ID or run the mixer when every operation
+    // necessarily selects shard zero.
+    if (!m_shardMask)
+      return 0u;
+
+    // Mix the producer thread ID before masking: Windows thread IDs often
+    // have aligned low bits, which would otherwise leave most shards idle.
+    uint32_t threadId = this_thread::get_id();
+    threadId *= 0x9e3779b9u;
+    threadId ^= threadId >> 16u;
+    return threadId & m_shardMask;
+  }
+
+
+  DxvkCsChunkPool::Allocation DxvkCsChunkPool::allocChunk(DxvkCsChunkFlags flags) {
+    uint32_t shardIndex = pickShard();
+    auto& shard = m_shards[shardIndex];
     DxvkCsChunk* chunk = nullptr;
 
-    { std::lock_guard<dxvk::mutex> lock(m_mutex);
+    { std::lock_guard<dxvk::mutex> lock(shard.mutex);
       
-      if (m_chunks.size() != 0) {
-        chunk = m_chunks.back();
-        m_chunks.pop_back();
+      if (shard.chunks.size() != 0) {
+        chunk = shard.chunks.back();
+        shard.chunks.pop_back();
       }
     }
     
@@ -83,15 +119,18 @@ namespace dxvk {
       chunk = new DxvkCsChunk();
     
     chunk->init(flags);
-    return chunk;
+    return { chunk, shardIndex };
   }
   
   
-  void DxvkCsChunkPool::freeChunk(DxvkCsChunk* chunk) {
+  void DxvkCsChunkPool::freeChunk(
+          DxvkCsChunk* chunk,
+          uint32_t     shardIndex) {
     chunk->reset();
-    
-    std::lock_guard<dxvk::mutex> lock(m_mutex);
-    m_chunks.push_back(chunk);
+
+    auto& shard = m_shards[shardIndex];
+    std::lock_guard<dxvk::mutex> lock(shard.mutex);
+    shard.chunks.push_back(chunk);
   }
   
   

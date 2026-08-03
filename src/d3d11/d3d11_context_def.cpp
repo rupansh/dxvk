@@ -2,15 +2,44 @@
 #include "d3d11_device.h"
 
 namespace dxvk {
+
+  constexpr size_t MaxHeliosRecycledCommandLists = 64u;
+
+  std::vector<Com<D3D11CommandList>> CreateHeliosRecycledCommandListCache() {
+    std::vector<Com<D3D11CommandList>> result;
+    if (heliosClRecycleCache())
+      result.reserve(MaxHeliosRecycledCommandLists);
+    return result;
+  }
   
   D3D11DeferredContext::D3D11DeferredContext(
           D3D11Device*    pParent,
     const Rc<DxvkDevice>& Device,
           UINT            ContextFlags)
   : D3D11CommonContext<D3D11DeferredContext>(pParent, Device, ContextFlags, 0u),
+    m_recycledCommandLists(CreateHeliosRecycledCommandListCache()),
     m_commandList(CreateCommandList()),
     m_destructionNotifier(this) {
     ResetContextState();
+  }
+
+
+  D3D11DeferredContext::~D3D11DeferredContext() {
+    // This is the actual lifetime endpoint for the DDI-owned cache. Logical
+    // RecycleCreateDeferredContext deliberately retains it for the next
+    // recording; ordinary vector destruction here releases every cached COM
+    // list and therefore preserves private-data/notifier destruction.
+    uint64_t drained = m_recycledCommandLists.size();
+    m_recycledCommandLists.clear();
+
+    if (unlikely(heliosClRecycleStats())) {
+      Logger::info(str::format(
+        "D3D11: Helios command-list recycle cache: hits=", m_heliosRecycleHits,
+        " misses=", m_heliosRecycleMisses,
+        " admitted=", m_heliosRecycleAdmitted,
+        " dropped=", m_heliosRecycleDropped,
+        " drained=", drained));
+    }
   }
   
   
@@ -146,11 +175,14 @@ namespace dxvk {
           BOOL                RestoreContextState) {
     D3D10DeviceLock lock = LockContext();
 
-    // Clear state so that the command list can't observe any
-    // current context state. The command list itself will clean
-    // up after execution to ensure that no state changes done
-    // by the command list are visible to the immediate context.
-    ResetCommandListState();
+    // Clear state so that the command list can't observe any current context
+    // state. When the previous nested list left a retained tail,
+    // ResetCommandListState consumes its exact saved footprint; this one
+    // sweep is also the required isolation before the child below.
+    if (!heliosClFastPath() || m_heliosCsState != D3D11HeliosCsState::Clean)
+      ResetCommandListState(heliosClFastPath()
+        ? D3D11CommandListResetMode::LogicalBindings
+        : D3D11CommandListResetMode::Physical);
 
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
 
@@ -166,18 +198,24 @@ namespace dxvk {
       // current command list and deal with context state
       m_chunkId = m_commandList->AddCommandList(commandList);
 
-      // Helios: a fast-path list has no trailing sweep, so record the
-      // clean-state restoration it would otherwise have provided — the
-      // recording that follows assumes a clean stream tail.
+      // Do not immediately materialize a fast child's cleanup. Its exact
+      // final-tail footprint is carried by this parent list, recursively, so
+      // the next Execute pre-reset or ordinary EmitCs can consume it in order.
+      // This is vital after Execute(FALSE), which clears the CPU shadow while
+      // the child's bindings remain live in this deferred CS stream.
       if (unlikely(!commandList->EndsClean()))
-        ResetCommandListState();
+        SetHeliosClLeftover(commandList->GetUsedBindings());
+      else {
+        m_heliosCsState = D3D11HeliosCsState::Clean;
+        m_heliosCsLeftoverBindings = { };
+      }
     }
 
     // Restore deferred context state
     if (RestoreContextState)
       RestoreCommandListState();
     else
-      ResetContextState();
+      ResetContextState(heliosClRetainSamplerRefs());
   }
   
   
@@ -190,14 +228,19 @@ namespace dxvk {
     FinalizeQueries();
 
     if (likely(heliosClFastPath())) {
-      // Helios: skip the recorded trailing reset sweep — the executing
-      // context re-establishes the clean state with its own per-execute
-      // sweep either way, so recording a second one into every list only
-      // feeds the dxvk-cs thread a constant-cost sweep per list. At the
-      // runtime's BUILD_2 granularity that was 2.66M recorded sweeps per
-      // GT2 run, 85 % of them for lists that were never executed. The list
-      // may now be genuinely empty; every consumer checks IsEmpty().
-      m_commandList->SetEndsClean(false);
+      // Omit a trailing sweep only while this recorded stream actually ends
+      // with unclean state. A nested child may be that final state even though
+      // Execute(FALSE) has reset this context's CPU shadow, so copy its saved
+      // footprint rather than taking a historical union of every child.
+      const bool endsClean = m_heliosCsState == D3D11HeliosCsState::Clean;
+      m_commandList->SetEndsClean(endsClean);
+
+      if (!endsClean) {
+        m_commandList->SetUsedBindings(
+          m_heliosCsState == D3D11HeliosCsState::ClLeftover
+            ? m_heliosCsLeftoverBindings
+            : GetMaxUsedBindings());
+      }
     } else {
       // Clean up command list state so that the any state changed
       // by this command list does not affect the calling context.
@@ -207,6 +250,12 @@ namespace dxvk {
 
     // Make sure all commands are visible to the command list
     FlushCsChunk();
+
+    if (unlikely(heliosClStats())) {
+      m_parent->NoteHeliosCommandListFinished(
+        m_commandList->IsEmpty(),
+        m_commandList->GetChunkCount());
+    }
     
     if (ppCommandList)
       *ppCommandList = m_commandList.ref();
@@ -217,11 +266,19 @@ namespace dxvk {
     // before the command list is actually executed.
     m_commandList = CreateCommandList();
     m_chunkId = 0;
+    // This is a new independent stream. Its eventual execution need not be
+    // adjacent to the list just finished, so it cannot inherit that list's
+    // clean tail.
+    m_heliosCsState = D3D11HeliosCsState::Unknown;
+    m_heliosCsLeftoverBindings = { };
     
     if (RestoreDeferredContextState)
       RestoreCommandListState();
+    else if (m_heliosDdiLogicalResetEnabled && heliosDdiLogicalReset()
+          && !heliosClRetainSamplerRefs())
+      ResetHeliosDdiLogicalState();
     else
-      ResetContextState();
+      ResetContextState(heliosClRetainSamplerRefs());
     
     m_mappedResources.clear();
     ResetStagingBuffer();
@@ -400,6 +457,14 @@ namespace dxvk {
 
 
   void D3D11DeferredContext::FinalizeQueries() {
+    // Query-end commands do not modify D3D11 binding state. If this stream
+    // already ended clean (or we first consume a retained child tail), retain
+    // that stronger fact after the final query end; an Unknown pre-existing
+    // tail remains Unknown conservatively.
+    const bool preservesCleanTail =
+      m_heliosCsState != D3D11HeliosCsState::Unknown;
+    const bool hasQueries = !m_queriesBegun.empty();
+
     for (auto& query : m_queriesBegun) {
       m_commandList->AddQuery(query.ptr());
 
@@ -410,11 +475,60 @@ namespace dxvk {
     }
 
     m_queriesBegun.clear();
+
+    if (hasQueries && preservesCleanTail)
+      m_heliosCsState = D3D11HeliosCsState::Clean;
+  }
+
+
+  bool D3D11DeferredContext::RecycleCommandList(D3D11CommandList* pCommandList) {
+    if (unlikely(!pCommandList
+              || !pCommandList->IsReusableBy(this)
+              || !heliosClRecycleCache())) {
+      if (unlikely(heliosClRecycleStats()))
+        m_heliosRecycleDropped += 1u;
+      return false;
+    }
+
+    // This callback is serialized by the runtime for this deferred context.
+    // Reset before taking the cache reference so chunks/queries/resources are
+    // released immediately; the cache holds only the empty command-list
+    // object and its vector capacity.
+    if (unlikely(m_recycledCommandLists.size() >= MaxHeliosRecycledCommandLists)) {
+      if (unlikely(heliosClRecycleStats()))
+        m_heliosRecycleDropped += 1u;
+      return false;
+    }
+
+    pCommandList->ResetForReuse();
+    // Capacity was reserved during DC construction, so this performs no
+    // allocation. attach moves the one IC hCL escrow reference directly into
+    // the cache: no AddRef/Release pair on the shared command-list object.
+    m_recycledCommandLists.push_back(Com<D3D11CommandList>::attach(pCommandList));
+
+    if (unlikely(heliosClRecycleStats()))
+      m_heliosRecycleAdmitted += 1u;
+    return true;
   }
 
 
   Com<D3D11CommandList> D3D11DeferredContext::CreateCommandList() {
-    return new D3D11CommandList(m_parent, m_flags);
+    if (likely(heliosClRecycleCache()) && !m_recycledCommandLists.empty()) {
+      Com<D3D11CommandList> commandList = std::move(m_recycledCommandLists.back());
+      m_recycledCommandLists.pop_back();
+
+      // The handoff reset it, but repeat the narrow reset here so a future
+      // cache producer cannot accidentally hand recording state back to us.
+      commandList->ResetForReuse();
+
+      if (unlikely(heliosClRecycleStats()))
+        m_heliosRecycleHits += 1u;
+      return commandList;
+    }
+
+    if (unlikely(heliosClRecycleStats()))
+      m_heliosRecycleMisses += 1u;
+    return new D3D11CommandList(m_parent, m_flags, this);
   }
   
   

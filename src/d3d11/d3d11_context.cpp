@@ -5,6 +5,7 @@
 #include "d3d11_context.h"
 #include "d3d11_context_def.h"
 #include "d3d11_context_imm.h"
+#include "d3d11_device.h"
 
 namespace dxvk {
 
@@ -983,7 +984,8 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::DrawAuto() {
     D3D10DeviceLock lock = LockContext();
 
-    D3D11Buffer* buffer = m_state.ia.vertexBuffers[0].buffer.ptr();
+    D3D11Buffer* buffer = HeliosDdiSlotIsValid(m_heliosDdiValidity.vertexBuffer, 0u)
+      ? m_state.ia.vertexBuffers[0].buffer.ptr() : nullptr;
 
     if (!buffer)
       return;
@@ -1231,19 +1233,20 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     auto inputLayout = static_cast<D3D11InputLayout*>(pInputLayout);
+    bool wasInvalid = HeliosDdiScalarWasInvalid(D3D11HeliosDdiIaLayout);
 
-    if (m_state.ia.inputLayout != inputLayout) {
+    if (wasInvalid || m_state.ia.inputLayout != inputLayout) {
       bool equal = false;
 
       // Some games (e.g. Grim Dawn) create lots and lots of
       // identical input layouts, so we'll only apply the state
       // if the input layouts has actually changed between calls.
-      if (m_state.ia.inputLayout != nullptr && inputLayout != nullptr)
+      if (!wasInvalid && m_state.ia.inputLayout != nullptr && inputLayout != nullptr)
         equal = m_state.ia.inputLayout->Compare(inputLayout);
 
       m_state.ia.inputLayout = inputLayout;
 
-      if (!equal)
+      if (wasInvalid || !equal)
         ApplyInputLayout();
     }
   }
@@ -1271,19 +1274,21 @@ namespace dxvk {
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
       auto newBuffer = static_cast<D3D11Buffer*>(ppVertexBuffers[i]);
+      uint32_t slot = StartSlot + i;
+      bool wasInvalid = HeliosDdiSlotWasInvalid(m_heliosDdiValidity.vertexBuffer, slot);
 
-      if (m_state.ia.vertexBuffers[StartSlot + i].buffer != newBuffer) {
-        m_state.ia.vertexBuffers[StartSlot + i].buffer = newBuffer;
-        m_state.ia.vertexBuffers[StartSlot + i].offset = pOffsets[i];
-        m_state.ia.vertexBuffers[StartSlot + i].stride = pStrides[i];
+      if (wasInvalid || m_state.ia.vertexBuffers[slot].buffer != newBuffer) {
+        m_state.ia.vertexBuffers[slot].buffer = newBuffer;
+        m_state.ia.vertexBuffers[slot].offset = pOffsets[i];
+        m_state.ia.vertexBuffers[slot].stride = pStrides[i];
 
-        BindVertexBuffer(StartSlot + i, newBuffer, pOffsets[i], pStrides[i]);
-      } else if (m_state.ia.vertexBuffers[StartSlot + i].offset != pOffsets[i]
-              || m_state.ia.vertexBuffers[StartSlot + i].stride != pStrides[i]) {
-        m_state.ia.vertexBuffers[StartSlot + i].offset = pOffsets[i];
-        m_state.ia.vertexBuffers[StartSlot + i].stride = pStrides[i];
+        BindVertexBuffer(slot, newBuffer, pOffsets[i], pStrides[i]);
+      } else if (m_state.ia.vertexBuffers[slot].offset != pOffsets[i]
+              || m_state.ia.vertexBuffers[slot].stride != pStrides[i]) {
+        m_state.ia.vertexBuffers[slot].offset = pOffsets[i];
+        m_state.ia.vertexBuffers[slot].stride = pStrides[i];
 
-        BindVertexBufferRange(StartSlot + i, newBuffer, pOffsets[i], pStrides[i]);
+        BindVertexBufferRange(slot, newBuffer, pOffsets[i], pStrides[i]);
       }
     }
 
@@ -1300,8 +1305,9 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     auto newBuffer = static_cast<D3D11Buffer*>(pIndexBuffer);
+    bool wasInvalid = HeliosDdiScalarWasInvalid(D3D11HeliosDdiIaIndex);
 
-    if (m_state.ia.indexBuffer.buffer != newBuffer) {
+    if (wasInvalid || m_state.ia.indexBuffer.buffer != newBuffer) {
       m_state.ia.indexBuffer.buffer = newBuffer;
       m_state.ia.indexBuffer.offset = Offset;
       m_state.ia.indexBuffer.format = Format;
@@ -1321,7 +1327,8 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::IAGetInputLayout(ID3D11InputLayout** ppInputLayout) {
     D3D10DeviceLock lock = LockContext();
 
-    *ppInputLayout = m_state.ia.inputLayout.ref();
+    *ppInputLayout = HeliosDdiScalarIsValid(D3D11HeliosDdiIaLayout)
+      ? m_state.ia.inputLayout.ref() : nullptr;
   }
 
 
@@ -1343,7 +1350,8 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
-      const bool inRange = StartSlot + i < m_state.ia.vertexBuffers.size();
+      const bool inRange = StartSlot + i < m_state.ia.vertexBuffers.size()
+        && HeliosDdiSlotIsValid(m_heliosDdiValidity.vertexBuffer, StartSlot + i);
 
       if (ppVertexBuffers) {
         ppVertexBuffers[i] = inRange
@@ -1374,13 +1382,16 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppIndexBuffer)
-      *ppIndexBuffer = m_state.ia.indexBuffer.buffer.ref();
+      *ppIndexBuffer = HeliosDdiScalarIsValid(D3D11HeliosDdiIaIndex)
+        ? m_state.ia.indexBuffer.buffer.ref() : nullptr;
 
     if (pFormat)
-      *pFormat = m_state.ia.indexBuffer.format;
+      *pFormat = HeliosDdiScalarIsValid(D3D11HeliosDdiIaIndex)
+        ? m_state.ia.indexBuffer.format : DXGI_FORMAT_UNKNOWN;
 
     if (pOffset)
-      *pOffset = m_state.ia.indexBuffer.offset;
+      *pOffset = HeliosDdiScalarIsValid(D3D11HeliosDdiIaIndex)
+        ? m_state.ia.indexBuffer.offset : 0u;
   }
 
 
@@ -1395,7 +1406,7 @@ namespace dxvk {
     SetClassInstances<D3D11ShaderType::eVertex>(
       shader ? shader->GetCommonShader() : nullptr, ppClassInstances, NumClassInstances);
 
-    if (m_state.vs != shader) {
+    if (HeliosDdiShaderWasInvalid(D3D11ShaderType::eVertex) || m_state.vs != shader) {
       m_state.vs = shader;
 
       BindShader<D3D11ShaderType::eVertex>(GetCommonShader(shader));
@@ -1462,7 +1473,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppVertexShader)
-      *ppVertexShader = m_state.vs.ref();
+      *ppVertexShader = HeliosDdiShaderIsValid(D3D11ShaderType::eVertex) ? m_state.vs.ref() : nullptr;
 
     GetClassInstances<D3D11ShaderType::eVertex>(ppClassInstances, pNumClassInstances);
   }
@@ -1531,7 +1542,7 @@ namespace dxvk {
     SetClassInstances<D3D11ShaderType::eHull>(
       shader ? shader->GetCommonShader() : nullptr, ppClassInstances, NumClassInstances);
 
-    if (m_state.hs != shader) {
+    if (HeliosDdiShaderWasInvalid(D3D11ShaderType::eHull) || m_state.hs != shader) {
       m_state.hs = shader;
 
       BindShader<D3D11ShaderType::eHull>(GetCommonShader(shader));
@@ -1598,7 +1609,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppHullShader)
-      *ppHullShader = m_state.hs.ref();
+      *ppHullShader = HeliosDdiShaderIsValid(D3D11ShaderType::eHull) ? m_state.hs.ref() : nullptr;
 
     GetClassInstances<D3D11ShaderType::eHull>(ppClassInstances, pNumClassInstances);
   }
@@ -1667,7 +1678,7 @@ namespace dxvk {
     SetClassInstances<D3D11ShaderType::eDomain>(
       shader ? shader->GetCommonShader() : nullptr, ppClassInstances, NumClassInstances);
 
-    if (m_state.ds != shader) {
+    if (HeliosDdiShaderWasInvalid(D3D11ShaderType::eDomain) || m_state.ds != shader) {
       m_state.ds = shader;
 
       BindShader<D3D11ShaderType::eDomain>(GetCommonShader(shader));
@@ -1734,7 +1745,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppDomainShader)
-      *ppDomainShader = m_state.ds.ref();
+      *ppDomainShader = HeliosDdiShaderIsValid(D3D11ShaderType::eDomain) ? m_state.ds.ref() : nullptr;
 
     GetClassInstances<D3D11ShaderType::eDomain>(ppClassInstances, pNumClassInstances);
   }
@@ -1803,7 +1814,7 @@ namespace dxvk {
     SetClassInstances<D3D11ShaderType::eGeometry>(
       shader ? shader->GetCommonShader() : nullptr, ppClassInstances, NumClassInstances);
 
-    if (m_state.gs != shader) {
+    if (HeliosDdiShaderWasInvalid(D3D11ShaderType::eGeometry) || m_state.gs != shader) {
       m_state.gs = shader;
 
       BindShader<D3D11ShaderType::eGeometry>(GetCommonShader(shader));
@@ -1870,7 +1881,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppGeometryShader)
-      *ppGeometryShader = m_state.gs.ref();
+      *ppGeometryShader = HeliosDdiShaderIsValid(D3D11ShaderType::eGeometry) ? m_state.gs.ref() : nullptr;
 
     GetClassInstances<D3D11ShaderType::eGeometry>(ppClassInstances, pNumClassInstances);
   }
@@ -1939,7 +1950,7 @@ namespace dxvk {
     SetClassInstances<D3D11ShaderType::ePixel>(
       shader ? shader->GetCommonShader() : nullptr, ppClassInstances, NumClassInstances);
 
-    if (m_state.ps != shader) {
+    if (HeliosDdiShaderWasInvalid(D3D11ShaderType::ePixel) || m_state.ps != shader) {
       m_state.ps = shader;
 
       BindShader<D3D11ShaderType::ePixel>(GetCommonShader(shader));
@@ -2006,7 +2017,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppPixelShader)
-      *ppPixelShader = m_state.ps.ref();
+      *ppPixelShader = HeliosDdiShaderIsValid(D3D11ShaderType::ePixel) ? m_state.ps.ref() : nullptr;
 
     GetClassInstances<D3D11ShaderType::ePixel>(ppClassInstances, pNumClassInstances);
   }
@@ -2075,7 +2086,7 @@ namespace dxvk {
     SetClassInstances<D3D11ShaderType::eCompute>(
       shader ? shader->GetCommonShader() : nullptr, ppClassInstances, NumClassInstances);
 
-    if (m_state.cs != shader) {
+    if (HeliosDdiShaderWasInvalid(D3D11ShaderType::eCompute) || m_state.cs != shader) {
       m_state.cs = shader;
 
       BindShader<D3D11ShaderType::eCompute>(GetCommonShader(shader));
@@ -2172,16 +2183,18 @@ namespace dxvk {
     for (uint32_t i = 0; i < NumUAVs; i++) {
       auto uav = static_cast<D3D11UnorderedAccessView*>(ppUnorderedAccessViews[i]);
       auto ctr = pUAVInitialCounts ? pUAVInitialCounts[i] : ~0u;
+      uint32_t slot = StartSlot + i;
+      bool wasInvalid = HeliosDdiSlotWasInvalid(m_heliosDdiValidity.uav, slot);
 
       if (ctr != ~0u && uav && uav->HasCounter())
         UpdateUnorderedAccessViewCounter(uav, ctr);
 
-      if (m_state.uav.views[StartSlot + i] != uav) {
-        m_state.uav.views[StartSlot + i] = uav;
-        m_state.uav.mask.set(StartSlot + i, uav != nullptr);
+      if (wasInvalid || m_state.uav.views[slot] != uav) {
+        m_state.uav.views[slot] = uav;
+        m_state.uav.mask.set(slot, uav != nullptr);
 
-        if (!DirtyComputeUnorderedAccessView(StartSlot + i, !uav))
-          BindUnorderedAccessView(D3D11ShaderType::eCompute, StartSlot + i, uav);
+        if (!DirtyComputeUnorderedAccessView(slot, !uav))
+          BindUnorderedAccessView(D3D11ShaderType::eCompute, slot, uav);
 
         ResolveCsSrvHazards(uav);
       }
@@ -2200,7 +2213,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppComputeShader)
-      *ppComputeShader = m_state.cs.ref();
+      *ppComputeShader = HeliosDdiShaderIsValid(D3D11ShaderType::eCompute) ? m_state.cs.ref() : nullptr;
 
     GetClassInstances<D3D11ShaderType::eCompute>(ppClassInstances, pNumClassInstances);
   }
@@ -2266,7 +2279,9 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     for (uint32_t i = 0; i < NumUAVs; i++) {
-      ppUnorderedAccessViews[i] = StartSlot + i < m_state.uav.views.size()
+      const bool valid = StartSlot + i < m_state.uav.views.size()
+        && HeliosDdiSlotIsValid(m_heliosDdiValidity.uav, StartSlot + i);
+      ppUnorderedAccessViews[i] = valid
         ? m_state.uav.views[StartSlot + i].ref()
         : nullptr;
     }
@@ -2311,8 +2326,9 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     auto blendState = static_cast<D3D11BlendState*>(pBlendState);
+    bool wasInvalid = HeliosDdiScalarWasInvalid(D3D11HeliosDdiOmBlend);
 
-    if (m_state.om.cbState    != blendState
+    if (wasInvalid || m_state.om.cbState    != blendState
      || m_state.om.sampleMask != SampleMask) {
       m_state.om.cbState    = blendState;
       m_state.om.sampleMask = SampleMask;
@@ -2336,8 +2352,9 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     auto depthStencilState = static_cast<D3D11DepthStencilState*>(pDepthStencilState);
+    bool wasInvalid = HeliosDdiScalarWasInvalid(D3D11HeliosDdiOmDepth);
 
-    if (m_state.om.dsState != depthStencilState) {
+    if (wasInvalid || m_state.om.dsState != depthStencilState) {
       m_state.om.dsState = depthStencilState;
       ApplyDepthStencilState();
     }
@@ -2376,18 +2393,23 @@ namespace dxvk {
 
     if (ppRenderTargetViews) {
       for (UINT i = 0; i < NumRTVs; i++) {
-        ppRenderTargetViews[i] = i < m_state.om.rtvs.size()
+        const bool valid = i < m_state.om.rtvs.size()
+          && HeliosDdiSlotIsValid(m_heliosDdiValidity.rtv, i);
+        ppRenderTargetViews[i] = valid
           ? m_state.om.rtvs[i].ref()
           : nullptr;
       }
     }
 
     if (ppDepthStencilView)
-      *ppDepthStencilView = m_state.om.dsv.ref();
+      *ppDepthStencilView = HeliosDdiScalarIsValid(D3D11HeliosDdiOmDsv)
+        ? m_state.om.dsv.ref() : nullptr;
 
     if (ppUnorderedAccessViews) {
       for (UINT i = 0; i < NumUAVs; i++) {
-        ppUnorderedAccessViews[i] = UAVStartSlot + i < m_state.om.uavs.size()
+        const bool valid = UAVStartSlot + i < m_state.om.uavs.size()
+          && HeliosDdiSlotIsValid(m_heliosDdiValidity.omUav, UAVStartSlot + i);
+        ppUnorderedAccessViews[i] = valid
           ? m_state.om.uavs[UAVStartSlot + i].ref()
           : nullptr;
       }
@@ -2403,7 +2425,8 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppBlendState)
-      *ppBlendState = m_state.om.cbState.ref();
+      *ppBlendState = HeliosDdiScalarIsValid(D3D11HeliosDdiOmBlend)
+        ? m_state.om.cbState.ref() : nullptr;
 
     if (BlendFactor)
       std::memcpy(BlendFactor, m_state.om.blendFactor, sizeof(FLOAT) * 4);
@@ -2420,7 +2443,8 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppDepthStencilState)
-      *ppDepthStencilState = m_state.om.dsState.ref();
+      *ppDepthStencilState = HeliosDdiScalarIsValid(D3D11HeliosDdiOmDepth)
+        ? m_state.om.dsState.ref() : nullptr;
 
     if (pStencilRef)
       *pStencilRef = m_state.om.stencilRef;
@@ -2432,8 +2456,9 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     auto newRasterizerState = static_cast<D3D11RasterizerState*>(pRasterizerState);
+    bool wasInvalid = HeliosDdiScalarWasInvalid(D3D11HeliosDdiRsState);
 
-    if (m_state.rs.state != newRasterizerState) {
+    if (wasInvalid || m_state.rs.state != newRasterizerState) {
       // Need to keep the previous rasterizer state object alive for the time being
       auto oldRasterizerState = std::move(m_state.rs.state);
 
@@ -2441,7 +2466,8 @@ namespace dxvk {
       ApplyRasterizerState();
 
       // If necessary, update the rasterizer sample count push constant
-      uint32_t oldSampleCount = oldRasterizerState ? oldRasterizerState->Desc().ForcedSampleCount : 0;
+      uint32_t oldSampleCount = wasInvalid ? 0u
+        : oldRasterizerState ? oldRasterizerState->Desc().ForcedSampleCount : 0u;
       uint32_t newSampleCount = newRasterizerState ? newRasterizerState->Desc().ForcedSampleCount : 0;
 
       if (oldSampleCount != newSampleCount)
@@ -2449,7 +2475,8 @@ namespace dxvk {
 
       // In D3D11, the rasterizer state defines whether the scissor test is
       // enabled, so if that changes, we need to update scissor rects as well.
-      bool oldScissorEnable = oldRasterizerState && oldRasterizerState->Desc().ScissorEnable;
+      bool oldScissorEnable = !wasInvalid
+        && oldRasterizerState && oldRasterizerState->Desc().ScissorEnable;
       bool newScissorEnable = newRasterizerState && newRasterizerState->Desc().ScissorEnable;
 
       if (oldScissorEnable != newScissorEnable)
@@ -2525,7 +2552,8 @@ namespace dxvk {
       }
     }
 
-    if (dirty && m_state.rs.state && m_state.rs.state->Desc().ScissorEnable)
+    if (dirty && HeliosDdiScalarIsValid(D3D11HeliosDdiRsState)
+              && m_state.rs.state && m_state.rs.state->Desc().ScissorEnable)
       ApplyViewportState();
   }
 
@@ -2535,7 +2563,8 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppRasterizerState)
-      *ppRasterizerState = m_state.rs.state.ref();
+      *ppRasterizerState = HeliosDdiScalarIsValid(D3D11HeliosDdiRsState)
+        ? m_state.rs.state.ref() : nullptr;
   }
 
 
@@ -2614,6 +2643,7 @@ namespace dxvk {
     }
 
     for (uint32_t i = 0; i < D3D11_SO_BUFFER_SLOT_COUNT; i++) {
+      HeliosDdiSlotWasInvalid(m_heliosDdiValidity.so, i);
       BindXfbBuffer(i,
         m_state.so.targets[i].buffer.ptr(),
         m_state.so.targets[i].offset);
@@ -2628,7 +2658,9 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
-      ppSOTargets[i] = i < m_state.so.targets.size()
+      const bool valid = i < m_state.so.targets.size()
+        && HeliosDdiSlotIsValid(m_heliosDdiValidity.so, i);
+      ppSOTargets[i] = valid
         ? m_state.so.targets[i].buffer.ref()
         : nullptr;
     }
@@ -2643,7 +2675,8 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
-      const bool inRange = i < m_state.so.targets.size();
+      const bool inRange = i < m_state.so.targets.size()
+        && HeliosDdiSlotIsValid(m_heliosDdiValidity.so, i);
 
       if (ppSOTargets) {
         ppSOTargets[i] = inRange
@@ -2667,6 +2700,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     auto predicate = D3D11Query::FromPredicate(pPredicate);
+    HeliosDdiScalarWasInvalid(D3D11HeliosDdiPredicate);
     m_state.pr.predicateObject = predicate;
     m_state.pr.predicateValue  = PredicateValue;
 
@@ -2684,7 +2718,8 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     if (ppPredicate)
-      *ppPredicate = D3D11Query::AsPredicate(m_state.pr.predicateObject.ref());
+      *ppPredicate = HeliosDdiScalarIsValid(D3D11HeliosDdiPredicate)
+        ? D3D11Query::AsPredicate(m_state.pr.predicateObject.ref()) : nullptr;
 
     if (pPredicateValue)
       *pPredicateValue = m_state.pr.predicateValue;
@@ -3182,9 +3217,10 @@ namespace dxvk {
 
     for (uint32_t slot : bit::BitMask(bindMask)) {
       const auto& cbv = state.buffers[slot];
+      const bool valid = HeliosDdiSlotIsValid(m_heliosDdiValidity.cbv[Stage], slot);
 
-      BindConstantBuffer(Stage, slot, cbv.buffer.ptr(),
-        cbv.constantOffset, cbv.constantBound);
+      BindConstantBuffer(Stage, slot, valid ? cbv.buffer.ptr() : nullptr,
+        valid ? cbv.constantOffset : 0u, valid ? cbv.constantBound : 0u);
     }
   }
 
@@ -3204,7 +3240,9 @@ namespace dxvk {
     DirtyMask.samplerMask -= bindMask;
 
     for (uint32_t slot : bit::BitMask(bindMask))
-      BindSampler(Stage, slot, state.samplers[slot].ptr());
+      BindSampler(Stage, slot,
+        HeliosDdiSlotIsValid(m_heliosDdiValidity.samplers[Stage], slot)
+          ? state.samplers[slot].ptr() : nullptr);
   }
 
 
@@ -3225,8 +3263,12 @@ namespace dxvk {
     // Need to clear dirty bits before binding
       DirtyMask.srvMask[maskIndex] -= bindMask;
 
-      for (uint32_t slot : bit::BitMask(bindMask))
-        BindShaderResource(Stage, slot + i, state.views[slot + i].ptr());
+      for (uint32_t slot : bit::BitMask(bindMask)) {
+        uint32_t binding = slot + i;
+        BindShaderResource(Stage, binding,
+          HeliosDdiSlotIsValid(m_heliosDdiValidity.srv[Stage], binding)
+            ? state.views[binding].ptr() : nullptr);
+      }
     }
   }
 
@@ -3248,8 +3290,12 @@ namespace dxvk {
     // Need to clear dirty bits before binding
     DirtyMask.uavMask -= bindMask;
 
-    for (uint32_t slot : bit::BitMask(bindMask))
-      BindUnorderedAccessView(Stage, slot, views[slot].ptr());
+    for (uint32_t slot : bit::BitMask(bindMask)) {
+      bool valid = Stage == D3D11ShaderType::eCompute
+        ? HeliosDdiSlotIsValid(m_heliosDdiValidity.uav, slot)
+        : HeliosDdiSlotIsValid(m_heliosDdiValidity.omUav, slot);
+      BindUnorderedAccessView(Stage, slot, valid ? views[slot].ptr() : nullptr);
+    }
   }
 
 
@@ -3300,7 +3346,8 @@ namespace dxvk {
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ApplyInputLayout() {
-    if (likely(m_state.ia.inputLayout != nullptr)) {
+    if (likely(HeliosDdiScalarIsValid(D3D11HeliosDdiIaLayout)
+            && m_state.ia.inputLayout != nullptr)) {
       uint32_t attributeCount = m_state.ia.inputLayout->GetAttributeCount();
       uint32_t bindingCount = m_state.ia.inputLayout->GetBindingCount();
 
@@ -3364,7 +3411,8 @@ namespace dxvk {
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ApplyBlendState() {
-    if (m_state.om.cbState != nullptr) {
+    if (HeliosDdiScalarIsValid(D3D11HeliosDdiOmBlend)
+     && m_state.om.cbState != nullptr) {
       EmitCs([
         cBlendState = m_state.om.cbState->GetBlendState(),
         cMsState    = m_state.om.cbState->GetMsState(m_state.om.sampleMask),
@@ -3406,7 +3454,8 @@ namespace dxvk {
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ApplyDepthStencilState() {
-    if (m_state.om.dsState != nullptr) {
+    if (HeliosDdiScalarIsValid(D3D11HeliosDdiOmDepth)
+     && m_state.om.dsState != nullptr) {
       EmitCs([
         cState = m_state.om.dsState->GetState()
       ] (DxvkContext* ctx) {
@@ -3432,7 +3481,8 @@ namespace dxvk {
   
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ApplyRasterizerState() {
-    if (m_state.rs.state != nullptr) {
+    if (HeliosDdiScalarIsValid(D3D11HeliosDdiRsState)
+     && m_state.rs.state != nullptr) {
       EmitCs([
         cState      = m_state.rs.state->GetState(),
         cDepthBias  = m_state.rs.state->GetDepthBias()
@@ -3455,7 +3505,7 @@ namespace dxvk {
     specData.sampleCount = m_state.om.sampleCount;
 
     if (unlikely(!specData.sampleCount)) {
-      specData.sampleCount = m_state.rs.state
+      specData.sampleCount = HeliosDdiScalarIsValid(D3D11HeliosDdiRsState) && m_state.rs.state
         ? m_state.rs.state->Desc().ForcedSampleCount
         : 0u;
 
@@ -3484,7 +3534,8 @@ namespace dxvk {
 
       // Vulkan does not provide an easy way to disable the scissor test,
       // Set scissor rects that are at least as large as the framebuffer.
-      bool enableScissorTest = m_state.rs.state && m_state.rs.state->Desc().ScissorEnable;
+      bool enableScissorTest = HeliosDdiScalarIsValid(D3D11HeliosDdiRsState)
+        && m_state.rs.state && m_state.rs.state->Desc().ScissorEnable;
 
       // D3D11's coordinate system has its origin in the bottom left,
       // but the viewport coordinates are aligned to the top-left
@@ -3753,13 +3804,15 @@ namespace dxvk {
     // so we'll just create a new one every time the render
     // target bindings are updated. Set up the attachments.
     for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
-      if (m_state.om.rtvs[i] != nullptr) {
+      if (HeliosDdiSlotIsValid(m_heliosDdiValidity.rtv, i)
+       && m_state.om.rtvs[i] != nullptr) {
         attachments.color[i].view = m_state.om.rtvs[i]->GetImageView();
         sampleCount = m_state.om.rtvs[i]->GetSampleCount();
       }
     }
 
-    if (m_state.om.dsv != nullptr) {
+    if (HeliosDdiScalarIsValid(D3D11HeliosDdiOmDsv)
+     && m_state.om.dsv != nullptr) {
       attachments.depth.view = m_state.om.dsv->GetImageView();
       sampleCount = m_state.om.dsv->GetSampleCount();
 
@@ -4765,21 +4818,23 @@ namespace dxvk {
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
       const bool inRange = StartSlot + i < bindings.buffers.size();
+      const bool valid = inRange && HeliosDdiSlotIsValid(
+        m_heliosDdiValidity.cbv[ShaderStage], StartSlot + i);
 
       if (ppConstantBuffers) {
-        ppConstantBuffers[i] = inRange
+        ppConstantBuffers[i] = valid
           ? bindings.buffers[StartSlot + i].buffer.ref()
           : nullptr;
       }
 
       if (pFirstConstant) {
-        pFirstConstant[i] = inRange
+        pFirstConstant[i] = valid
           ? bindings.buffers[StartSlot + i].constantOffset
           : 0u;
       }
 
       if (pNumConstants) {
-        pNumConstants[i] = inRange
+        pNumConstants[i] = valid
           ? bindings.buffers[StartSlot + i].constantCount
           : 0u;
       }
@@ -4796,7 +4851,9 @@ namespace dxvk {
     const auto& bindings = m_state.srv[ShaderStage];
 
     for (uint32_t i = 0; i < NumViews; i++) {
-      ppShaderResourceViews[i] = StartSlot + i < bindings.views.size()
+      const bool valid = StartSlot + i < bindings.views.size()
+        && HeliosDdiSlotIsValid(m_heliosDdiValidity.srv[ShaderStage], StartSlot + i);
+      ppShaderResourceViews[i] = valid
         ? bindings.views[StartSlot + i].ref()
         : nullptr;
     }
@@ -4812,7 +4869,9 @@ namespace dxvk {
     const auto& bindings = m_state.samplers[ShaderStage];
 
     for (uint32_t i = 0; i < NumSamplers; i++) {
-      ppSamplers[i] = StartSlot + i < bindings.samplers.size()
+      const bool valid = StartSlot + i < bindings.samplers.size()
+        && HeliosDdiSlotIsValid(m_heliosDdiValidity.samplers[ShaderStage], StartSlot + i);
+      ppSamplers[i] = valid
         ? bindings.samplers[StartSlot + i].ref()
         : nullptr;
     }
@@ -4902,16 +4961,98 @@ namespace dxvk {
 
 
   template<typename ContextType>
-  void D3D11CommonContext<ContextType>::ResetCommandListState() {
-    // Helios: mark the stream Unknown BEFORE emitting so the EmitCs funnel
-    // does not recursively sweep, and Clean after — callers (and the funnel
-    // itself) use Clean to elide back-to-back sweeps.
-    if constexpr (!IsDeferred)
-      m_heliosCsState = D3D11HeliosCsState::Unknown;
+  void D3D11CommonContext<ContextType>::ResetCommandListState(
+          D3D11CommandListResetMode     Mode) {
+    // A pending fast-list tail is not represented by m_state after an
+    // ExecuteCommandList(FALSE). This single sweep is both that child's
+    // cleanup and the required isolation before the next command list. For
+    // every other tail, the CPU shadow remains the authoritative footprint.
+    const D3D11MaxUsedBindings usedBindings =
+      m_heliosCsState == D3D11HeliosCsState::ClLeftover
+        ? m_heliosCsLeftoverBindings
+        : GetMaxUsedBindings();
 
-    EmitCs([
-      cUsedBindings  = GetMaxUsedBindings()
+    // Mark Unknown before EmitCs so the reset itself cannot recursively try
+    // to consume the tail that it is about to clear.
+    m_heliosCsState = D3D11HeliosCsState::Unknown;
+
+    EmitCommandListStateReset(usedBindings, Mode);
+
+    m_heliosCsState = D3D11HeliosCsState::Clean;
+    m_heliosCsLeftoverBindings = { };
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::HeliosNoteCsEmit(bool AllowFlush) {
+    if (m_heliosCsState == D3D11HeliosCsState::ClLeftover) {
+      // The CPU shadow was reset by ExecuteCommandList(FALSE), so sweep the
+      // command list's saved final-tail footprint rather than GetMaxUsedBindings.
+      // Set Unknown first to make the nested EmitCs call non-recursive.
+      m_heliosCsState = D3D11HeliosCsState::Unknown;
+      EmitCommandListStateReset(
+        m_heliosCsLeftoverBindings,
+        D3D11CommandListResetMode::LogicalBindings,
+        AllowFlush);
+      m_heliosCsLeftoverBindings = { };
+    }
+
+    // An ordinary command after either a clean sweep or the just-consumed
+    // tail means the final physical state is no longer known to be clean.
+    m_heliosCsState = D3D11HeliosCsState::Unknown;
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::EmitCommandListStateReset(
+    const D3D11MaxUsedBindings&       UsedBindings,
+          D3D11CommandListResetMode    Mode,
+          bool                         AllowFlush) {
+    const bool epochReset = heliosClFastPath();
+    const bool logicalBindingReset = epochReset
+      && Mode == D3D11CommandListResetMode::LogicalBindings;
+    const bool bulkReset = heliosClBulkStateReset();
+    const bool statsEnabled = heliosClStats();
+
+    uint64_t bulkResetSlots = 0u;
+
+    if (!epochReset && bulkReset && statsEnabled) {
+      bulkResetSlots = UsedBindings.vbCount + UsedBindings.soCount;
+
+      for (uint32_t i = 0; i < D3D11ShaderTypeCount; i++) {
+        const auto& bindings = UsedBindings.stages[i];
+
+        // One API-independent pair of CB slots (ICB + instance data) is
+        // cleared for every stage in addition to the D3D11 API CBV range.
+        bulkResetSlots += 2u + bindings.cbvCount
+          + bindings.srvCount + bindings.samplerCount;
+
+        if (i == uint32_t(D3D11ShaderType::ePixel)
+         || i == uint32_t(D3D11ShaderType::eCompute))
+          bulkResetSlots += 2u * bindings.uavCount;
+      }
+    }
+
+    auto reset = [
+      cUsedBindings = UsedBindings,
+      cEpochReset = epochReset,
+      cLogicalBindingReset = logicalBindingReset,
+      cBulkReset = bulkReset,
+      cStatsEnabled = statsEnabled,
+      cBulkResetSlots = bulkResetSlots,
+      cDevice = m_parent
     ] (DxvkContext* ctx) {
+      // Command-list isolation only needs a new logical binding generation.
+      // Real ClearState/context-state boundaries take the physical form so no
+      // stale Rc survives an API-visible release point. With CL_FAST disabled,
+      // retain the original used-range sweeps below byte-for-byte.
+      if (cEpochReset) {
+        if (cLogicalBindingReset)
+          ctx->resetBindingEpoch();
+        else
+          ctx->resetBindingEpochAndDrain();
+      }
+
       // Reset render targets
       ctx->bindRenderTargets(DxvkRenderTargets(), 0u);
 
@@ -4942,74 +5083,146 @@ namespace dxvk {
       // Unbind indirect draw buffer
       ctx->bindDrawBuffers(DxvkBufferSlice(), DxvkBufferSlice());
 
-      // Unbind index and vertex buffers
-      ctx->bindIndexBuffer(DxvkBufferSlice(), VK_INDEX_TYPE_UINT32);
+      if (!cEpochReset) {
+        // Unbind index and vertex buffers
+        ctx->bindIndexBuffer(DxvkBufferSlice(), VK_INDEX_TYPE_UINT32);
 
-      for (uint32_t i = 0; i < cUsedBindings.vbCount; i++)
-        ctx->bindVertexBuffer(i, DxvkBufferSlice(), 0);
+        if (cBulkReset) {
+          ctx->clearVertexBuffers(0u, cUsedBindings.vbCount);
+        } else {
+          for (uint32_t i = 0; i < cUsedBindings.vbCount; i++)
+            ctx->bindVertexBuffer(i, DxvkBufferSlice(), 0);
+        }
 
-      // Unbind transform feedback buffers
-      for (uint32_t i = 0; i < cUsedBindings.soCount; i++)
-        ctx->bindXfbBuffer(i, DxvkBufferSlice(), DxvkBufferSlice());
+        // Unbind transform feedback buffers
+        if (cBulkReset) {
+          ctx->clearXfbBuffers(0u, cUsedBindings.soCount);
+        } else {
+          for (uint32_t i = 0; i < cUsedBindings.soCount; i++)
+            ctx->bindXfbBuffer(i, DxvkBufferSlice(), DxvkBufferSlice());
+        }
+      }
 
       // Unbind all shaders
-      ctx->bindShader<VK_SHADER_STAGE_VERTEX_BIT>(nullptr);
-      ctx->bindShader<VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT>(nullptr);
-      ctx->bindShader<VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT>(nullptr);
-      ctx->bindShader<VK_SHADER_STAGE_GEOMETRY_BIT>(nullptr);
-      ctx->bindShader<VK_SHADER_STAGE_FRAGMENT_BIT>(nullptr);
-      ctx->bindShader<VK_SHADER_STAGE_COMPUTE_BIT>(nullptr);
+      if (cBulkReset) {
+        ctx->clearShaders();
+      } else {
+        ctx->bindShader<VK_SHADER_STAGE_VERTEX_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_GEOMETRY_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_FRAGMENT_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_COMPUTE_BIT>(nullptr);
+      }
 
-      // Unbind per-shader stage resources
-      for (uint32_t i = 0; i < 6; i++) {
-        auto programType = D3D11ShaderType(i);
-        auto stage = GetShaderStage(programType);
+      // The epoch owns every descriptor binding class. The original bounded
+      // loops remain the exact CL_FAST=0 rollback implementation.
+      if (!cEpochReset) {
+        for (uint32_t i = 0; i < 6; i++) {
+          auto programType = D3D11ShaderType(i);
+          auto stage = GetShaderStage(programType);
 
-        // Unbind constant buffers, including the shader's ICB and instance data buffer
-        auto cbSlotId = D3D11ShaderResourceMapping::computeCbvBinding(programType, 0);
-        ctx->bindUniformBuffer(stage, cbSlotId + D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT + 0u, DxvkBufferSlice());
-        ctx->bindUniformBuffer(stage, cbSlotId + D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT + 1u, DxvkBufferSlice());
+          // Unbind constant buffers, including the shader's ICB and instance data buffer
+          auto cbSlotId = D3D11ShaderResourceMapping::computeCbvBinding(programType, 0);
 
-        for (uint32_t j = 0; j < cUsedBindings.stages[i].cbvCount; j++)
-          ctx->bindUniformBuffer(stage, cbSlotId + j, DxvkBufferSlice());
+          if (cBulkReset) {
+            ctx->clearUniformBuffers(stage, cbSlotId
+              + D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, 2u);
+            ctx->clearUniformBuffers(stage, cbSlotId,
+              cUsedBindings.stages[i].cbvCount);
+          } else {
+            ctx->bindUniformBuffer(stage, cbSlotId + D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT + 0u, DxvkBufferSlice());
+            ctx->bindUniformBuffer(stage, cbSlotId + D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT + 1u, DxvkBufferSlice());
 
-        // Unbind shader resource views
-        auto srvSlotId = D3D11ShaderResourceMapping::computeSrvBinding(programType, 0);
+            for (uint32_t j = 0; j < cUsedBindings.stages[i].cbvCount; j++)
+              ctx->bindUniformBuffer(stage, cbSlotId + j, DxvkBufferSlice());
+          }
 
-        for (uint32_t j = 0; j < cUsedBindings.stages[i].srvCount; j++)
-          ctx->bindResourceImageView(stage, srvSlotId + j, nullptr);
+          // Unbind shader resource views
+          auto srvSlotId = D3D11ShaderResourceMapping::computeSrvBinding(programType, 0);
 
-        // Unbind texture samplers
-        auto samplerSlotId = D3D11ShaderResourceMapping::computeSamplerBinding(programType, 0);
+          if (cBulkReset) {
+            ctx->clearResourceImageViews(stage, srvSlotId,
+              cUsedBindings.stages[i].srvCount);
+          } else {
+            for (uint32_t j = 0; j < cUsedBindings.stages[i].srvCount; j++)
+              ctx->bindResourceImageView(stage, srvSlotId + j, nullptr);
+          }
 
-        for (uint32_t j = 0; j < cUsedBindings.stages[i].samplerCount; j++)
-          ctx->bindResourceSampler(stage, samplerSlotId + j, nullptr);
+          // Unbind texture samplers
+          auto samplerSlotId = D3D11ShaderResourceMapping::computeSamplerBinding(programType, 0);
 
-        // Unbind UAVs for supported stages
-        if (programType == D3D11ShaderType::ePixel
-         || programType == D3D11ShaderType::eCompute) {
-          VkShaderStageFlags stages = programType == D3D11ShaderType::ePixel
-            ? VK_SHADER_STAGE_ALL_GRAPHICS
-            : VK_SHADER_STAGE_COMPUTE_BIT;
+          if (cBulkReset) {
+            ctx->clearResourceSamplers(stage, samplerSlotId,
+              cUsedBindings.stages[i].samplerCount);
+          } else {
+            for (uint32_t j = 0; j < cUsedBindings.stages[i].samplerCount; j++)
+              ctx->bindResourceSampler(stage, samplerSlotId + j, nullptr);
+          }
 
-          auto uavSlotId = D3D11ShaderResourceMapping::computeUavBinding(programType, 0);
-          auto ctrSlotId = D3D11ShaderResourceMapping::computeUavCounterBinding(programType, 0);
+          // Unbind UAVs for supported stages
+          if (programType == D3D11ShaderType::ePixel
+           || programType == D3D11ShaderType::eCompute) {
+            VkShaderStageFlags stages = programType == D3D11ShaderType::ePixel
+              ? VK_SHADER_STAGE_ALL_GRAPHICS
+              : VK_SHADER_STAGE_COMPUTE_BIT;
 
-          for (uint32_t j = 0; j < cUsedBindings.stages[i].uavCount; j++) {
-            ctx->bindResourceImageView(stages, uavSlotId, nullptr);
-            ctx->bindResourceBufferView(stages, ctrSlotId, nullptr);
+            auto uavSlotId = D3D11ShaderResourceMapping::computeUavBinding(programType, 0);
+            auto ctrSlotId = D3D11ShaderResourceMapping::computeUavCounterBinding(programType, 0);
+
+            if (cBulkReset) {
+              ctx->clearResourceImageViews(stages, uavSlotId,
+                cUsedBindings.stages[i].uavCount);
+              ctx->clearResourceBufferViews(stages, ctrSlotId,
+                cUsedBindings.stages[i].uavCount);
+            } else {
+              for (uint32_t j = 0; j < cUsedBindings.stages[i].uavCount; j++) {
+                ctx->bindResourceImageView(stages, uavSlotId + j, nullptr);
+                ctx->bindResourceBufferView(stages, ctrSlotId + j, nullptr);
+              }
+            }
           }
         }
       }
-    });
 
-    if constexpr (!IsDeferred)
-      m_heliosCsState = D3D11HeliosCsState::Clean;
+      if (!cEpochReset && cBulkReset && cStatsEnabled)
+        cDevice->NoteHeliosBulkStateReset(cBulkResetSlots);
+    };
+
+    if (AllowFlush)
+      EmitCs(std::move(reset));
+    else
+      EmitCs<false>(std::move(reset));
   }
 
 
   template<typename ContextType>
-  void D3D11CommonContext<ContextType>::ResetContextState() {
+  void D3D11CommonContext<ContextType>::ResetContextState(
+          bool RetainSamplerRefs) {
+    // A hard reset is a real lifetime boundary. Any references retained by a
+    // prior DDI logical clear are still owned by m_state and are released by
+    // the ordinary sweeps below.
+    if (m_heliosDdiLogicalStateActive) {
+      // Logical clear zeros all active ranges, so re-expand them before the
+      // stock reset helpers run. This slow sweep is deliberately restricted
+      // to hard lifetime boundaries and drains both current and stale slots.
+      m_state.ia.maxVbCount = m_state.ia.vertexBuffers.size();
+      m_state.om.maxRtv = m_state.om.rtvs.size();
+      m_state.om.minUav = 0u;
+      m_state.om.maxUav = m_state.om.uavs.size();
+      m_state.uav.maxCount = m_state.uav.views.size();
+
+      for (uint32_t i = 0u; i < D3D11ShaderTypeCount; i++) {
+        auto stage = D3D11ShaderType(i);
+        m_state.cbv[stage].maxCount = m_state.cbv[stage].buffers.size();
+        m_state.srv[stage].maxCount = m_state.srv[stage].views.size();
+        m_state.samplers[stage].maxCount = m_state.samplers[stage].samplers.size();
+        m_state.instances[stage].instanceCount = D3D11ClassInstanceState::MaxInstances;
+      }
+    }
+    m_heliosDdiLogicalStateActive = false;
+    m_heliosDdiValidity.reset();
+
     // Reset shaders
     m_state.vs = nullptr;
     m_state.hs = nullptr;
@@ -5030,13 +5243,87 @@ namespace dxvk {
     m_state.cbv.reset();
     m_state.srv.reset();
     m_state.uav.reset();
-    m_state.samplers.reset();
+    if (RetainSamplerRefs)
+      RetainHeliosSamplerRefs();
+    else {
+      // A normal ClearState/reset is a real lifetime boundary. Do not let a
+      // prior BUILD_2 logical reset extend any sampler object's lifetime.
+      m_state.samplers.reset();
+      m_heliosRetainedSamplers.reset();
+    }
 
     // Reset dirty tracking
     m_state.lazy.reset();
 
     // Reset class instances
     m_state.instances.reset();
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::ResetHeliosDdiLogicalState() {
+    m_heliosDdiLogicalStateActive = true;
+    m_heliosDdiValidity.advance();
+
+    // Never touch a Com<> field here: it carries one bounded private reference
+    // per state-table slot. Reset scalar/default metadata so stale entries are
+    // neither API-visible nor used by non-binding state paths.
+    m_state.id.reset();
+    m_state.ia.primitiveTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    m_state.ia.maxVbCount = 0u;
+    m_state.ia.indexBuffer.offset = 0u;
+    m_state.ia.indexBuffer.format = DXGI_FORMAT_UNKNOWN;
+    m_state.om.sampleCount = 0u;
+    m_state.om.sampleMask = D3D11_DEFAULT_SAMPLE_MASK;
+    m_state.om.stencilRef = D3D11_DEFAULT_STENCIL_REFERENCE;
+    std::fill(std::begin(m_state.om.blendFactor), std::end(m_state.om.blendFactor), 1.0f);
+    m_state.om.maxRtv = 0u;
+    m_state.om.minUav = D3D11_1_UAV_SLOT_COUNT;
+    m_state.om.maxUav = 0u;
+    m_state.rs.numViewports = 0u;
+    m_state.rs.numScissors = 0u;
+    m_state.pr.predicateValue = false;
+
+    for (uint32_t i = 0u; i < D3D11ShaderTypeCount; i++) {
+      auto stage = D3D11ShaderType(i);
+      m_state.cbv[stage].maxCount = 0u;
+      m_state.srv[stage].hazardous.clear();
+      m_state.srv[stage].maxCount = 0u;
+      m_state.samplers[stage].maxCount = 0u;
+      m_state.instances[stage].instanceCount = 0u;
+    }
+
+    m_state.uav.mask.clear();
+    m_state.uav.maxCount = 0u;
+    m_state.lazy.reset();
+    m_heliosStagedSrvSeen = false;
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::RetainHeliosSamplerRefs() {
+    // This transfers the existing private reference, rather than copying the
+    // pointer. `m_state` remains the sole API-visible state table and is
+    // logically empty after this function, so GetSamplers returns default/null
+    // state. The cache is per context, so it introduces neither shared
+    // ownership nor additional cross-thread state.
+    for (uint32_t i = 0; i < D3D11ShaderTypeCount; i++) {
+      auto stage = D3D11ShaderType(i);
+      auto& active = m_state.samplers[stage];
+      auto& retained = m_heliosRetainedSamplers[stage];
+
+      for (uint32_t slot = 0; slot < active.maxCount; slot++) {
+        if (active.samplers[slot])
+          retained.samplers[slot] = std::move(active.samplers[slot]);
+      }
+
+      // Empty retained entries are harmless, but maxCount must cover every
+      // slot that can still own a private reference so a later full reset (or
+      // destruction) drains it. The active maxCount is API-visible state and
+      // must be zero after Finish/Execute with restore=false.
+      retained.maxCount = std::max(retained.maxCount, active.maxCount);
+      active.maxCount = 0;
+    }
   }
 
 
@@ -5115,13 +5402,15 @@ namespace dxvk {
 
     bool hazard = false;
 
-    if (CheckViewOverlap(pView, m_state.om.dsv.ptr())) {
+    if (HeliosDdiScalarIsValid(D3D11HeliosDdiOmDsv)
+     && CheckViewOverlap(pView, m_state.om.dsv.ptr())) {
       m_state.om.dsv = nullptr;
       hazard = true;
     }
 
     for (uint32_t i = 0; i < m_state.om.maxRtv; i++) {
-      if (CheckViewOverlap(pView, m_state.om.rtvs[i].ptr())) {
+      if (HeliosDdiSlotIsValid(m_heliosDdiValidity.rtv, i)
+       && CheckViewOverlap(pView, m_state.om.rtvs[i].ptr())) {
         m_state.om.rtvs[i] = nullptr;
         hazard = true;
       }
@@ -5138,7 +5427,8 @@ namespace dxvk {
       return;
 
     for (uint32_t i = 0; i < m_state.om.maxUav; i++) {
-      if (CheckViewOverlap(pView, m_state.om.uavs[i].ptr())) {
+      if (HeliosDdiSlotIsValid(m_heliosDdiValidity.omUav, i)
+       && CheckViewOverlap(pView, m_state.om.uavs[i].ptr())) {
         m_state.om.uavs[i] = nullptr;
 
         if (!DirtyGraphicsUnorderedAccessView(i))
@@ -5152,12 +5442,18 @@ namespace dxvk {
   void D3D11CommonContext<ContextType>::RestoreCommandListState() {
     BindFramebuffer();
 
-    BindShader<D3D11ShaderType::eVertex>(GetCommonShader(m_state.vs.ptr()));
-    BindShader<D3D11ShaderType::eHull>(GetCommonShader(m_state.hs.ptr()));
-    BindShader<D3D11ShaderType::eDomain>(GetCommonShader(m_state.ds.ptr()));
-    BindShader<D3D11ShaderType::eGeometry>(GetCommonShader(m_state.gs.ptr()));
-    BindShader<D3D11ShaderType::ePixel>(GetCommonShader(m_state.ps.ptr()));
-    BindShader<D3D11ShaderType::eCompute>(GetCommonShader(m_state.cs.ptr()));
+    BindShader<D3D11ShaderType::eVertex>(GetCommonShader(
+      HeliosDdiShaderIsValid(D3D11ShaderType::eVertex) ? m_state.vs.ptr() : nullptr));
+    BindShader<D3D11ShaderType::eHull>(GetCommonShader(
+      HeliosDdiShaderIsValid(D3D11ShaderType::eHull) ? m_state.hs.ptr() : nullptr));
+    BindShader<D3D11ShaderType::eDomain>(GetCommonShader(
+      HeliosDdiShaderIsValid(D3D11ShaderType::eDomain) ? m_state.ds.ptr() : nullptr));
+    BindShader<D3D11ShaderType::eGeometry>(GetCommonShader(
+      HeliosDdiShaderIsValid(D3D11ShaderType::eGeometry) ? m_state.gs.ptr() : nullptr));
+    BindShader<D3D11ShaderType::ePixel>(GetCommonShader(
+      HeliosDdiShaderIsValid(D3D11ShaderType::ePixel) ? m_state.ps.ptr() : nullptr));
+    BindShader<D3D11ShaderType::eCompute>(GetCommonShader(
+      HeliosDdiShaderIsValid(D3D11ShaderType::eCompute) ? m_state.cs.ptr() : nullptr));
 
     ApplyInputLayout();
     ApplyPrimitiveTopology();
@@ -5170,19 +5466,22 @@ namespace dxvk {
     ApplyViewportState();
 
     BindIndexBuffer(
-      m_state.ia.indexBuffer.buffer.ptr(),
+      HeliosDdiScalarIsValid(D3D11HeliosDdiIaIndex)
+        ? m_state.ia.indexBuffer.buffer.ptr() : nullptr,
       m_state.ia.indexBuffer.offset,
       m_state.ia.indexBuffer.format);
 
     for (uint32_t i = 0; i < m_state.ia.maxVbCount; i++) {
+      const bool valid = HeliosDdiSlotIsValid(m_heliosDdiValidity.vertexBuffer, i);
       BindVertexBuffer(i,
-        m_state.ia.vertexBuffers[i].buffer.ptr(),
-        m_state.ia.vertexBuffers[i].offset,
-        m_state.ia.vertexBuffers[i].stride);
+        valid ? m_state.ia.vertexBuffers[i].buffer.ptr() : nullptr,
+        valid ? m_state.ia.vertexBuffers[i].offset : 0u,
+        valid ? m_state.ia.vertexBuffers[i].stride : 0u);
     }
 
     for (uint32_t i = 0; i < m_state.so.targets.size(); i++)
-      BindXfbBuffer(i, m_state.so.targets[i].buffer.ptr(), ~0u);
+      BindXfbBuffer(i, HeliosDdiSlotIsValid(m_heliosDdiValidity.so, i)
+        ? m_state.so.targets[i].buffer.ptr() : nullptr, ~0u);
 
     // Reset dirty binding and shader masks before applying
     // bindings to avoid implicit null binding overrids.
@@ -5212,8 +5511,10 @@ namespace dxvk {
     const auto& bindings = m_state.cbv[Stage];
 
     for (uint32_t i = 0; i < bindings.maxCount; i++) {
-      BindConstantBuffer(Stage, i, bindings.buffers[i].buffer.ptr(),
-        bindings.buffers[i].constantOffset, bindings.buffers[i].constantBound);
+      const bool valid = HeliosDdiSlotIsValid(m_heliosDdiValidity.cbv[Stage], i);
+      BindConstantBuffer(Stage, i, valid ? bindings.buffers[i].buffer.ptr() : nullptr,
+        valid ? bindings.buffers[i].constantOffset : 0u,
+        valid ? bindings.buffers[i].constantBound : 0u);
     }
   }
 
@@ -5224,7 +5525,8 @@ namespace dxvk {
     const auto& bindings = m_state.samplers[Stage];
 
     for (uint32_t i = 0; i < bindings.maxCount; i++)
-      BindSampler(Stage, i, bindings.samplers[i].ptr());
+      BindSampler(Stage, i, HeliosDdiSlotIsValid(m_heliosDdiValidity.samplers[Stage], i)
+        ? bindings.samplers[i].ptr() : nullptr);
   }
 
 
@@ -5234,7 +5536,8 @@ namespace dxvk {
     const auto& bindings = m_state.srv[Stage];
 
     for (uint32_t i = 0; i < bindings.maxCount; i++)
-      BindShaderResource(Stage, i, bindings.views[i].ptr());
+      BindShaderResource(Stage, i, HeliosDdiSlotIsValid(m_heliosDdiValidity.srv[Stage], i)
+        ? bindings.views[i].ptr() : nullptr);
   }
 
 
@@ -5249,8 +5552,12 @@ namespace dxvk {
       ? m_state.uav.maxCount
       : m_state.om.maxUav;
 
-    for (uint32_t i = 0; i < maxCount; i++)
-      BindUnorderedAccessView(Stage, i, views[i].ptr());
+    for (uint32_t i = 0; i < maxCount; i++) {
+      bool valid = Stage == D3D11ShaderType::eCompute
+        ? HeliosDdiSlotIsValid(m_heliosDdiValidity.uav, i)
+        : HeliosDdiSlotIsValid(m_heliosDdiValidity.omUav, i);
+      BindUnorderedAccessView(Stage, i, valid ? views[i].ptr() : nullptr);
+    }
   }
 
 
@@ -5264,21 +5571,24 @@ namespace dxvk {
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
       auto newBuffer = static_cast<D3D11Buffer*>(ppConstantBuffers[i]);
+      uint32_t slot = StartSlot + i;
+      bool wasInvalid = HeliosDdiSlotWasInvalid(
+        m_heliosDdiValidity.cbv[ShaderStage], slot);
 
       uint32_t constantCount = newBuffer
         ? std::min(newBuffer->Desc()->ByteWidth / 16, UINT(D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT))
         : 0u;
 
-      if (bindings.buffers[StartSlot + i].buffer         != newBuffer
-       || bindings.buffers[StartSlot + i].constantOffset != 0
-       || bindings.buffers[StartSlot + i].constantCount  != constantCount) {
-        bindings.buffers[StartSlot + i].buffer         = newBuffer;
-        bindings.buffers[StartSlot + i].constantOffset = 0;
-        bindings.buffers[StartSlot + i].constantCount  = constantCount;
-        bindings.buffers[StartSlot + i].constantBound  = constantCount;
+      if (wasInvalid || bindings.buffers[slot].buffer         != newBuffer
+       || bindings.buffers[slot].constantOffset != 0
+       || bindings.buffers[slot].constantCount  != constantCount) {
+        bindings.buffers[slot].buffer         = newBuffer;
+        bindings.buffers[slot].constantOffset = 0;
+        bindings.buffers[slot].constantCount  = constantCount;
+        bindings.buffers[slot].constantBound  = constantCount;
 
-        if (!DirtyConstantBuffer(ShaderStage, StartSlot + i, !newBuffer))
-          BindConstantBuffer(ShaderStage, StartSlot + i, newBuffer, 0, constantCount);
+        if (!DirtyConstantBuffer(ShaderStage, slot, !newBuffer))
+          BindConstantBuffer(ShaderStage, slot, newBuffer, 0, constantCount);
       }
     }
 
@@ -5299,6 +5609,9 @@ namespace dxvk {
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
       auto newBuffer = static_cast<D3D11Buffer*>(ppConstantBuffers[i]);
+      uint32_t slot = StartSlot + i;
+      bool wasInvalid = HeliosDdiSlotWasInvalid(
+        m_heliosDdiValidity.cbv[ShaderStage], slot);
 
       UINT constantOffset;
       UINT constantCount;
@@ -5329,22 +5642,22 @@ namespace dxvk {
       }
 
       // Do a full rebind if either the buffer changes
-      if (bindings.buffers[StartSlot + i].buffer != newBuffer) {
-        bindings.buffers[StartSlot + i].buffer = newBuffer;
-        bindings.buffers[StartSlot + i].constantOffset = constantOffset;
-        bindings.buffers[StartSlot + i].constantCount  = constantCount;
-        bindings.buffers[StartSlot + i].constantBound  = constantBound;
+      if (wasInvalid || bindings.buffers[slot].buffer != newBuffer) {
+        bindings.buffers[slot].buffer = newBuffer;
+        bindings.buffers[slot].constantOffset = constantOffset;
+        bindings.buffers[slot].constantCount  = constantCount;
+        bindings.buffers[slot].constantBound  = constantBound;
 
-        if (!DirtyConstantBuffer(ShaderStage, StartSlot + i, !newBuffer))
-          BindConstantBuffer(ShaderStage, StartSlot + i, newBuffer, constantOffset, constantBound);
-      } else if (bindings.buffers[StartSlot + i].constantOffset != constantOffset
-              || bindings.buffers[StartSlot + i].constantCount  != constantCount) {
-        bindings.buffers[StartSlot + i].constantOffset = constantOffset;
-        bindings.buffers[StartSlot + i].constantCount  = constantCount;
-        bindings.buffers[StartSlot + i].constantBound  = constantBound;
+        if (!DirtyConstantBuffer(ShaderStage, slot, !newBuffer))
+          BindConstantBuffer(ShaderStage, slot, newBuffer, constantOffset, constantBound);
+      } else if (bindings.buffers[slot].constantOffset != constantOffset
+              || bindings.buffers[slot].constantCount  != constantCount) {
+        bindings.buffers[slot].constantOffset = constantOffset;
+        bindings.buffers[slot].constantCount  = constantCount;
+        bindings.buffers[slot].constantBound  = constantBound;
 
-        if (!DirtyConstantBuffer(ShaderStage, StartSlot + i, !newBuffer))
-          BindConstantBufferRange(ShaderStage, StartSlot + i, constantOffset, constantBound);
+        if (!DirtyConstantBuffer(ShaderStage, slot, !newBuffer))
+          BindConstantBufferRange(ShaderStage, slot, constantOffset, constantBound);
       }
     }
 
@@ -5363,8 +5676,11 @@ namespace dxvk {
 
     for (uint32_t i = 0; i < NumResources; i++) {
       auto resView = static_cast<D3D11ShaderResourceView*>(ppResources[i]);
+      uint32_t slot = StartSlot + i;
+      bool wasInvalid = HeliosDdiSlotWasInvalid(
+        m_heliosDdiValidity.srv[ShaderStage], slot);
 
-      if (bindings.views[StartSlot + i] != resView) {
+      if (wasInvalid || bindings.views[slot] != resView) {
         if (likely(resView != nullptr)) {
           if (unlikely(resView->TestHazards())) {
             if (TestSrvHazards<ShaderStage>(resView))
@@ -5373,11 +5689,11 @@ namespace dxvk {
             // Only set if necessary, but don't reset it on every
             // bind as this would be more expensive than a few
             // redundant checks in OMSetRenderTargets and friends.
-            bindings.hazardous.set(StartSlot + i, resView);
+            bindings.hazardous.set(slot, resView);
           }
         }
 
-        bindings.views[StartSlot + i] = resView;
+        bindings.views[slot] = resView;
 
         // Helios: arm the per-draw staged-SRV freshness gate. One pointer
         // test on binding changes; the gate itself disarms when a scan
@@ -5386,8 +5702,8 @@ namespace dxvk {
                   && resView->GetHeliosStagedImage() != nullptr))
           m_heliosStagedSrvSeen = true;
 
-        if (!DirtyShaderResource(ShaderStage, StartSlot + i, !resView))
-          BindShaderResource(ShaderStage, StartSlot + i, resView);
+        if (!DirtyShaderResource(ShaderStage, slot, !resView))
+          BindShaderResource(ShaderStage, slot, resView);
       }
     }
 
@@ -5403,15 +5719,41 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
     auto& bindings = m_state.samplers[ShaderStage];
+    auto& retained = m_heliosRetainedSamplers[ShaderStage];
+    const bool retainSamplerRefs = heliosClRetainSamplerRefs();
 
     for (uint32_t i = 0; i < NumSamplers; i++) {
       auto sampler = static_cast<D3D11SamplerState*>(ppSamplers[i]);
 
-      if (bindings.samplers[StartSlot + i] != sampler) {
-        bindings.samplers[StartSlot + i] = sampler;
+      uint32_t slot = StartSlot + i;
+      bool wasInvalid = HeliosDdiSlotWasInvalid(
+        m_heliosDdiValidity.samplers[ShaderStage], slot);
 
-        if (!DirtySampler(ShaderStage, StartSlot + i, !sampler))
-          BindSampler(ShaderStage, StartSlot + i, sampler);
+      if (wasInvalid || bindings.samplers[slot] != sampler) {
+        // The retained cache is only populated by an opt-in logical reset.
+        // A matching object is moved back, so no private atomic is touched;
+        // we nevertheless run the normal DirtySampler/BindSampler path below
+        // because this is a new command-list recording with logically-null
+        // API state. A different object drops the cached private ref first,
+        // then takes the ordinary AddRefPrivate path for the new binding.
+        if (retainSamplerRefs
+         && retained.samplers[slot] == sampler) {
+          bindings.samplers[slot] = std::move(retained.samplers[slot]);
+        } else {
+          if (retainSamplerRefs)
+            retained.samplers[slot] = nullptr;
+
+          bindings.samplers[slot] = sampler;
+        }
+
+        if (!DirtySampler(ShaderStage, slot, !sampler))
+          BindSampler(ShaderStage, slot, sampler);
+      } else if (retainSamplerRefs && !sampler) {
+        // A logical reset leaves the active slot null while the matching
+        // retained slot may still own a private reference. An explicit null
+        // bind is API-visible no-op state, but it must still end that hidden
+        // lifetime without emitting another null binding command.
+        retained.samplers[slot] = nullptr;
       }
     }
 
@@ -5445,8 +5787,9 @@ namespace dxvk {
         auto rtv = i < NumRTVs
           ? static_cast<D3D11RenderTargetView*>(ppRenderTargetViews[i])
           : nullptr;
+        bool wasInvalid = HeliosDdiSlotWasInvalid(m_heliosDdiValidity.rtv, i);
 
-        if (m_state.om.rtvs[i] != rtv) {
+        if (wasInvalid || m_state.om.rtvs[i] != rtv) {
           m_state.om.rtvs[i] = rtv;
           needsUpdate = true;
           ResolveOmSrvHazards(rtv);
@@ -5459,8 +5802,9 @@ namespace dxvk {
       }
 
       auto dsv = static_cast<D3D11DepthStencilView*>(pDepthStencilView);
+      bool dsvWasInvalid = HeliosDdiScalarWasInvalid(D3D11HeliosDdiOmDsv);
 
-      if (m_state.om.dsv != dsv) {
+      if (dsvWasInvalid || m_state.om.dsv != dsv) {
         m_state.om.dsv = dsv;
         needsUpdate = true;
         ResolveOmSrvHazards(dsv);
@@ -5490,7 +5834,8 @@ namespace dxvk {
           if (ctr != ~0u && uav && uav->HasCounter())
             UpdateUnorderedAccessViewCounter(uav, ctr);
 
-          if (m_state.om.uavs[i] != uav) {
+          bool wasInvalid = HeliosDdiSlotWasInvalid(m_heliosDdiValidity.omUav, i);
+          if (wasInvalid || m_state.om.uavs[i] != uav) {
             m_state.om.uavs[i] = uav;
 
             if (!DirtyGraphicsUnorderedAccessView(i))
@@ -5613,13 +5958,18 @@ namespace dxvk {
         uav = m_state.uav.mask.findNext(uav + 1);
       }
     } else {
-      hazard = CheckViewOverlap(pView, m_state.om.dsv.ptr());
+      hazard = HeliosDdiScalarIsValid(D3D11HeliosDdiOmDsv)
+        && CheckViewOverlap(pView, m_state.om.dsv.ptr());
 
-      for (uint32_t i = 0; !hazard && i < m_state.om.maxRtv; i++)
-        hazard = CheckViewOverlap(pView, m_state.om.rtvs[i].ptr());
+      for (uint32_t i = 0; !hazard && i < m_state.om.maxRtv; i++) {
+        if (HeliosDdiSlotIsValid(m_heliosDdiValidity.rtv, i))
+          hazard = CheckViewOverlap(pView, m_state.om.rtvs[i].ptr());
+      }
 
-      for (uint32_t i = 0; !hazard && i < m_state.om.maxUav; i++)
-        hazard = CheckViewOverlap(pView, m_state.om.uavs[i].ptr());
+      for (uint32_t i = 0; !hazard && i < m_state.om.maxUav; i++) {
+        if (HeliosDdiSlotIsValid(m_heliosDdiValidity.omUav, i))
+          hazard = CheckViewOverlap(pView, m_state.om.uavs[i].ptr());
+      }
     }
 
     return hazard;
@@ -6005,8 +6355,10 @@ namespace dxvk {
 
     // Assign class instances for state tracking and populate
     // constant buffer containing class instance data */
-    for (uint32_t i = 0u; i < NumClassInstances && i < D3D11ClassInstanceState::MaxInstances; i++)
+    for (uint32_t i = 0u; i < NumClassInstances && i < D3D11ClassInstanceState::MaxInstances; i++) {
+      HeliosDdiSlotWasInvalid(m_heliosDdiValidity.instances[ShaderStage], i);
       state.instances[i] = static_cast<D3D11ClassInstance*>(ppClassInstances[i]);
+    }
 
     // Unset previously bound class instances, if any
     for (uint32_t i = NumClassInstances; i < state.instanceCount; i++)
@@ -6022,7 +6374,9 @@ namespace dxvk {
       auto data = reinterpret_cast<D3D11InstanceData*>(slice->mapPtr());
 
       for (uint32_t i = 0u; i < D3D11ClassInstanceState::MaxInstances; i++)
-        data[i] = pShader->GetClassInstanceData(i, state.instances[i].ptr());
+        data[i] = pShader->GetClassInstanceData(i,
+          HeliosDdiSlotIsValid(m_heliosDdiValidity.instances[ShaderStage], i)
+            ? state.instances[i].ptr() : nullptr);
 
       EmitCs([
         cSlotId = slotId,
@@ -6055,6 +6409,7 @@ namespace dxvk {
       if (ppClassInstances) {
         for (uint32_t i = 0u; i < *pNumClassInstances; i++) {
           ppClassInstances[i] = i < state.instanceCount
+            && HeliosDdiSlotIsValid(m_heliosDdiValidity.instances[ShaderStage], i)
             ? state.instances[i].ref()
             : nullptr;
         }

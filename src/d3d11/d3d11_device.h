@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -27,6 +28,31 @@
 
 namespace dxvk {
   class DxgiAdapter;
+
+  /**
+   * \brief Bounded command-list fast-path diagnostics
+   *
+   * Counters are per D3D11 device and use relaxed atomics because deferred
+   * contexts may finish lists concurrently. They are reported once at device
+   * teardown, not on the hot path.
+   */
+  struct D3D11HeliosCommandListStats {
+    std::atomic<uint64_t> finishedEmpty     = { 0u };
+    std::atomic<uint64_t> finishedZeroChunk = { 0u };
+    std::atomic<uint64_t> finishedOneChunk  = { 0u };
+    std::atomic<uint64_t> finishedMultiChunk = { 0u };
+
+    std::atomic<uint64_t> executedEmpty     = { 0u };
+    std::atomic<uint64_t> executedZeroChunk = { 0u };
+    std::atomic<uint64_t> executedOneChunk  = { 0u };
+    std::atomic<uint64_t> executedMultiChunk = { 0u };
+
+    std::atomic<uint64_t> inlineAdmitted    = { 0u };
+    std::atomic<uint64_t> inlineCapFlushes  = { 0u };
+
+    std::atomic<uint64_t> bulkResetCalls    = { 0u };
+    std::atomic<uint64_t> bulkResetSlots    = { 0u };
+  };
   
   class D3D11Buffer;
   class D3D11CommonShader;
@@ -461,8 +487,62 @@ namespace dxvk {
             DXGI_VK_FORMAT_MODE   Mode) const;
     
     DxvkCsChunkRef AllocCsChunk(DxvkCsChunkFlags flags) {
-      DxvkCsChunk* chunk = m_csChunkPool.allocChunk(flags);
-      return DxvkCsChunkRef(chunk, &m_csChunkPool);
+      auto allocation = m_csChunkPool.allocChunk(flags);
+      return DxvkCsChunkRef(allocation.chunk, &m_csChunkPool, allocation.shard);
+    }
+
+    void NoteHeliosCommandListFinished(bool Empty, uint32_t ChunkCount) {
+      if (unlikely(!heliosClStats()))
+        return;
+
+      auto& stats = m_heliosCommandListStats;
+
+      if (Empty)
+        stats.finishedEmpty.fetch_add(1u, std::memory_order_relaxed);
+      else if (!ChunkCount)
+        stats.finishedZeroChunk.fetch_add(1u, std::memory_order_relaxed);
+      else if (ChunkCount == 1u)
+        stats.finishedOneChunk.fetch_add(1u, std::memory_order_relaxed);
+      else
+        stats.finishedMultiChunk.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    void NoteHeliosCommandListExecuted(bool Empty, uint32_t ChunkCount) {
+      if (unlikely(!heliosClStats()))
+        return;
+
+      auto& stats = m_heliosCommandListStats;
+
+      if (Empty)
+        stats.executedEmpty.fetch_add(1u, std::memory_order_relaxed);
+      else if (!ChunkCount)
+        stats.executedZeroChunk.fetch_add(1u, std::memory_order_relaxed);
+      else if (ChunkCount == 1u)
+        stats.executedOneChunk.fetch_add(1u, std::memory_order_relaxed);
+      else
+        stats.executedMultiChunk.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    void NoteHeliosInlineReplayAdmission() {
+      if (unlikely(!heliosClStats()))
+        return;
+
+      m_heliosCommandListStats.inlineAdmitted.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    void NoteHeliosInlineReplayCapFlush() {
+      if (unlikely(!heliosClStats()))
+        return;
+
+      m_heliosCommandListStats.inlineCapFlushes.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    void NoteHeliosBulkStateReset(uint64_t Slots) {
+      if (unlikely(!heliosClStats()))
+        return;
+
+      m_heliosCommandListStats.bulkResetCalls.fetch_add(1u, std::memory_order_relaxed);
+      m_heliosCommandListStats.bulkResetSlots.fetch_add(Slots, std::memory_order_relaxed);
     }
     
     const D3D11Options* GetOptions() const {
@@ -513,6 +593,8 @@ namespace dxvk {
     DxvkShaderOptions               m_shaderOptions = { };
 
     DxvkCsChunkPool                 m_csChunkPool;
+
+    D3D11HeliosCommandListStats     m_heliosCommandListStats;
 
     D3D11Initializer*               m_initializer = nullptr;
     D3D10Device*                    m_d3d10Device = nullptr;

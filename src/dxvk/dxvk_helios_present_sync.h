@@ -20,9 +20,10 @@ namespace dxvk {
    *
    * Transport: a small memory-mapped FILE under ProgramData (both principals
    * demonstrably have rights there; no Global\ section namespace or handle
-   * duplication involved). Slots are seqlock-protected: writers bump \c seq
-   * to odd, write, bump to even; readers retry on odd/changed seq. Slot
-   * claims CAS the resid field so concurrent producers never share a slot.
+   * duplication involved). Slots use \c seq as both an inter-process writer
+   * lock and a seqlock: a writer CASes even to odd, changes the key and
+   * payload, then publishes the next even value; readers retry on an
+   * odd/changed sequence.
    */
   class HeliosPresentSync {
 
@@ -46,6 +47,19 @@ namespace dxvk {
      */
     static bool publish(uint32_t resid, uint32_t pid, uint32_t fenceId, uint64_t value,
       bool kwaitOrdered = false);
+
+    /**
+     * \brief Releases this process's publication for a destroyed resource
+     *
+     * Called only at the backing VkDeviceMemory lifetime boundary. The slot is
+     * cleared only when pid, producer creation time, and the per-device fence
+     * generation still identify this publication. This prevents an old
+     * allocation surviving an in-process adapter reset from erasing a new
+     * device's reused Venus resource id.
+     *
+     * \returns \c true when this process owned and released the slot
+     */
+    static bool release(uint32_t resid, uint32_t fenceId);
 
     /**
      * \brief Looks up the latest published (pid, value) for a resource id

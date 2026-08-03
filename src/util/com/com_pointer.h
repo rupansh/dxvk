@@ -63,8 +63,23 @@ namespace dxvk {
     }
     
     Com(Com&& other)
+    noexcept
     : m_ptr(other.m_ptr) {
       other.m_ptr = nullptr;
+    }
+
+    /**
+     * \brief Adopt an already-owned COM reference
+     *
+     * Unlike the pointer constructor, this performs no AddRef. The caller
+     * must transfer exactly one public reference and must not release it
+     * afterwards. The Helios BUILD_2 command-list handoff uses this to move
+     * the IC hCL escrow directly into its originating deferred-context cache.
+     */
+    static Com attach(T* object) {
+      Com result;
+      result.m_ptr = object;
+      return result;
     }
     
     Com& operator = (T* object) {

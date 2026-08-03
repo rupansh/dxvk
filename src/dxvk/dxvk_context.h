@@ -191,6 +191,7 @@ namespace dxvk {
             VkIndexType           indexType) {
       m_state.vi.indexBuffer = std::move(buffer);
       m_state.vi.indexType   = indexType;
+      m_bindingEpoch.indexBuffer = m_bindingEpoch.value;
 
       m_flags.set(DxvkContextFlag::GpDirtyIndexBuffer);
     }
@@ -207,8 +208,10 @@ namespace dxvk {
             VkDeviceSize          offset,
             VkDeviceSize          length,
             VkIndexType           indexType) {
-      m_state.vi.indexBuffer.setRange(offset, length);
-      m_state.vi.indexType = indexType;
+      if (this->materializeIndexBuffer()) {
+        m_state.vi.indexBuffer.setRange(offset, length);
+        m_state.vi.indexType = indexType;
+      }
 
       m_flags.set(DxvkContextFlag::GpDirtyIndexBuffer);
     }
@@ -228,6 +231,30 @@ namespace dxvk {
             uint32_t              slot,
             DxvkBufferSlice&&     buffer) {
       m_uniformBuffers[slot] = std::move(buffer);
+      m_bindingEpoch.uniformBuffers[slot] = m_bindingEpoch.value;
+
+      m_descriptorState.dirtyBuffers(stages);
+    }
+
+    /**
+     * \brief Clears a contiguous range of uniform-buffer bindings
+     *
+     * Equivalent to calling \ref bindUniformBuffer with an empty slice for
+     * every slot in the range. Kept as a range operation so API front ends
+     * can clear known binding footprints without repeatedly updating the
+     * same descriptor dirty bits.
+     */
+    void clearUniformBuffers(
+            VkShaderStageFlags    stages,
+            uint32_t              slot,
+            uint32_t              count) {
+      if (!count)
+        return;
+
+      for (uint32_t i = 0; i < count; i++) {
+        m_uniformBuffers[slot + i] = DxvkBufferSlice();
+        m_bindingEpoch.uniformBuffers[slot + i] = m_bindingEpoch.value;
+      }
 
       m_descriptorState.dirtyBuffers(stages);
     }
@@ -243,7 +270,8 @@ namespace dxvk {
             uint32_t              slot,
             VkDeviceSize          offset,
             VkDeviceSize          length) {
-      m_uniformBuffers[slot].setRange(offset, length);
+      if (this->materializeUniformBuffer(slot))
+        m_uniformBuffers[slot].setRange(offset, length);
 
       m_descriptorState.dirtyBuffers(stages);
     }
@@ -259,12 +287,49 @@ namespace dxvk {
             VkShaderStageFlags    stages,
             uint32_t              slot,
             Rc<DxvkImageView>&&   view) {
-      if (likely(m_resources[slot].imageView != view || m_resources[slot].bufferView)) {
+      if (likely(!this->isBindingCurrent(m_bindingEpoch.resources[slot])
+               || m_resources[slot].imageView != view || m_resources[slot].bufferView)) {
         m_resources[slot].bufferView = nullptr;
         m_resources[slot].imageView = std::move(view);
+        m_bindingEpoch.resources[slot] = m_bindingEpoch.value;
 
         m_descriptorState.dirtyViews(stages);
       }
+    }
+
+    /**
+     * \brief Clears a contiguous range of resource-view bindings
+     *
+     * Mirrors bindResourceImageView(..., nullptr): both view kinds are
+     * released and descriptor views become dirty only if at least one slot
+     * changed. This preserves the no-op dirty-mask behavior of the scalar
+     * binding path.
+     */
+    void clearResourceImageViews(
+            VkShaderStageFlags    stages,
+            uint32_t              slot,
+            uint32_t              count) {
+      bool dirty = false;
+
+      for (uint32_t i = 0; i < count; i++) {
+        uint32_t binding = slot + i;
+        auto& view = m_resources[binding];
+
+        if (this->isBindingCurrent(m_bindingEpoch.resources[binding])
+         && (view.imageView || view.bufferView)) {
+          view.bufferView = nullptr;
+          view.imageView = nullptr;
+          dirty = true;
+        } else if (!this->isBindingCurrent(m_bindingEpoch.resources[binding])) {
+          view.bufferView = nullptr;
+          view.imageView = nullptr;
+        }
+
+        m_bindingEpoch.resources[binding] = m_bindingEpoch.value;
+      }
+
+      if (dirty)
+        m_descriptorState.dirtyViews(stages);
     }
 
     /**
@@ -278,12 +343,47 @@ namespace dxvk {
             VkShaderStageFlags    stages,
             uint32_t              slot,
             Rc<DxvkBufferView>&&  view) {
-      if (likely(m_resources[slot].bufferView != view || m_resources[slot].imageView)) {
+      if (likely(!this->isBindingCurrent(m_bindingEpoch.resources[slot])
+               || m_resources[slot].bufferView != view || m_resources[slot].imageView)) {
         m_resources[slot].imageView = nullptr;
         m_resources[slot].bufferView = std::move(view);
+        m_bindingEpoch.resources[slot] = m_bindingEpoch.value;
 
         m_descriptorState.dirtyViews(stages);
       }
+    }
+
+    /**
+     * \brief Clears a contiguous range of buffer-view bindings
+     *
+     * Mirrors bindResourceBufferView(..., nullptr), including the release
+     * order of an accidentally resident image view before its buffer view.
+     */
+    void clearResourceBufferViews(
+            VkShaderStageFlags    stages,
+            uint32_t              slot,
+            uint32_t              count) {
+      bool dirty = false;
+
+      for (uint32_t i = 0; i < count; i++) {
+        uint32_t binding = slot + i;
+        auto& view = m_resources[binding];
+
+        if (this->isBindingCurrent(m_bindingEpoch.resources[binding])
+         && (view.imageView || view.bufferView)) {
+          view.imageView = nullptr;
+          view.bufferView = nullptr;
+          dirty = true;
+        } else if (!this->isBindingCurrent(m_bindingEpoch.resources[binding])) {
+          view.imageView = nullptr;
+          view.bufferView = nullptr;
+        }
+
+        m_bindingEpoch.resources[binding] = m_bindingEpoch.value;
+      }
+
+      if (dirty)
+        m_descriptorState.dirtyViews(stages);
     }
 
     /**
@@ -299,11 +399,43 @@ namespace dxvk {
             VkShaderStageFlags    stages,
             uint32_t              slot,
             Rc<DxvkSampler>&&     sampler) {
-      if (likely(m_samplers[slot] != sampler)) {
+      if (likely(!this->isBindingCurrent(m_bindingEpoch.samplers[slot])
+               || m_samplers[slot] != sampler)) {
         m_samplers[slot] = std::move(sampler);
+        m_bindingEpoch.samplers[slot] = m_bindingEpoch.value;
 
         m_descriptorState.dirtySamplers(stages);
       }
+    }
+
+    /**
+     * \brief Clears a contiguous range of sampler bindings
+     *
+     * Equivalent to scalar null binds while preserving their no-op dirty-mask
+     * behavior when every slot was already null.
+     */
+    void clearResourceSamplers(
+            VkShaderStageFlags    stages,
+            uint32_t              slot,
+            uint32_t              count) {
+      bool dirty = false;
+
+      for (uint32_t i = 0; i < count; i++) {
+        uint32_t binding = slot + i;
+        auto& sampler = m_samplers[binding];
+
+        if (this->isBindingCurrent(m_bindingEpoch.samplers[binding]) && sampler) {
+          sampler = nullptr;
+          dirty = true;
+        } else if (!this->isBindingCurrent(m_bindingEpoch.samplers[binding])) {
+          sampler = nullptr;
+        }
+
+        m_bindingEpoch.samplers[binding] = m_bindingEpoch.value;
+      }
+
+      if (dirty)
+        m_descriptorState.dirtySamplers(stages);
     }
 
     /**
@@ -353,6 +485,22 @@ namespace dxvk {
           DxvkContextFlag::GpDirtyPipelineState);
       }
     }
+
+    /**
+     * \brief Clears all graphics and compute shaders
+     *
+     * Has the same final shader state and pipeline-dirty flags as the six
+     * scalar null shader binds used by D3D11 ClearState semantics.
+     */
+    void clearShaders() {
+      m_state.gp.shaders = DxvkGraphicsPipelineShaders();
+      m_state.cp.shaders = DxvkComputePipelineShaders();
+
+      m_flags.set(
+        DxvkContextFlag::GpDirtyPipeline,
+        DxvkContextFlag::GpDirtyPipelineState,
+        DxvkContextFlag::CpDirtyPipelineState);
+    }
     
     /**
      * \brief Binds vertex buffer
@@ -367,6 +515,28 @@ namespace dxvk {
             uint32_t              stride) {
       m_state.vi.vertexBuffers[binding] = std::move(buffer);
       m_state.vi.vertexStrides[binding] = stride;
+      m_bindingEpoch.vertexBuffers[binding] = m_bindingEpoch.value;
+      m_flags.set(DxvkContextFlag::GpDirtyVertexBuffers);
+    }
+
+    /**
+     * \brief Clears a contiguous range of vertex-buffer bindings
+     *
+     * Equivalent to scalar empty binds. Vertex bindings are intentionally
+     * dirtied even when already empty, matching bindVertexBuffer.
+     */
+    void clearVertexBuffers(
+            uint32_t              binding,
+            uint32_t              count) {
+      if (!count)
+        return;
+
+      for (uint32_t i = 0; i < count; i++) {
+        m_state.vi.vertexBuffers[binding + i] = DxvkBufferSlice();
+        m_state.vi.vertexStrides[binding + i] = 0u;
+        m_bindingEpoch.vertexBuffers[binding + i] = m_bindingEpoch.value;
+      }
+
       m_flags.set(DxvkContextFlag::GpDirtyVertexBuffers);
     }
 
@@ -384,8 +554,11 @@ namespace dxvk {
             VkDeviceSize          offset,
             VkDeviceSize          length,
             uint32_t              stride) {
-      m_state.vi.vertexBuffers[binding].setRange(offset, length);
-      m_state.vi.vertexStrides[binding] = stride;
+      if (this->materializeVertexBuffer(binding)) {
+        m_state.vi.vertexBuffers[binding].setRange(offset, length);
+        m_state.vi.vertexStrides[binding] = stride;
+      }
+
       m_flags.set(DxvkContextFlag::GpDirtyVertexBuffers);
     }
 
@@ -402,9 +575,51 @@ namespace dxvk {
             DxvkBufferSlice&&     counter) {
       m_state.xfb.buffers [binding] = std::move(buffer);
       m_state.xfb.counters[binding] = std::move(counter);
+      m_bindingEpoch.xfbBuffers[binding] = m_bindingEpoch.value;
 
       m_flags.set(DxvkContextFlag::GpDirtyXfbBuffers);
     }
+
+    /**
+     * \brief Clears a contiguous range of transform-feedback bindings
+     *
+     * Deliberately leaves activeCounters alone, just like bindXfbBuffer; an
+     * active transform-feedback pass owns those until it is paused.
+     */
+    void clearXfbBuffers(
+            uint32_t              binding,
+            uint32_t              count) {
+      if (!count)
+        return;
+
+      for (uint32_t i = 0; i < count; i++) {
+        m_state.xfb.buffers [binding + i] = DxvkBufferSlice();
+        m_state.xfb.counters[binding + i] = DxvkBufferSlice();
+        m_bindingEpoch.xfbBuffers[binding + i] = m_bindingEpoch.value;
+      }
+
+      m_flags.set(DxvkContextFlag::GpDirtyXfbBuffers);
+    }
+
+    /**
+     * \brief Resets all binding classes with a new epoch
+     *
+     * Makes all descriptor, vertex-input and transform-feedback bindings
+     * logically default without walking the previously used binding ranges.
+     * Physical references are released as their slots are overwritten, or by
+     * the fixed-capacity drain used when the epoch counter wraps.
+     */
+    void resetBindingEpoch();
+
+    /**
+     * \brief Physically resets all epoch-owned bindings
+     *
+     * Releases every retained binding reference and returns the epoch table
+     * to its initial state. Use this for real ClearState and context-state
+     * lifetime boundaries; command-list isolation uses \ref resetBindingEpoch
+     * so its normal path remains constant-time.
+     */
+    void resetBindingEpochAndDrain();
 
     /**
      * \brief Blits an image
@@ -1385,9 +1600,110 @@ namespace dxvk {
       std::vector<DxvkLegacyDescriptor> infos;
     } m_legacyDescriptors;
 
+    struct DxvkBindingEpochState {
+      uint32_t value = 0u;
+
+      uint32_t indexBuffer = 0u;
+
+      std::array<uint32_t, MaxNumUniformBufferSlots> uniformBuffers = { };
+      std::array<uint32_t, MaxNumResourceSlots>      resources      = { };
+      std::array<uint32_t, MaxNumSamplerSlots>       samplers       = { };
+
+      std::array<uint32_t, MaxNumVertexBindings> vertexBuffers = { };
+      std::array<uint32_t, MaxNumXfbBuffers>     xfbBuffers    = { };
+    } m_bindingEpoch;
+
     std::array<Rc<DxvkSampler>, MaxNumSamplerSlots> m_samplers;
     std::array<DxvkBufferSlice, MaxNumUniformBufferSlots> m_uniformBuffers;
     std::array<DxvkViewPair, MaxNumResourceSlots> m_resources;
+
+    DxvkBufferSlice  m_emptyBufferSlice;
+    DxvkViewPair     m_emptyResource;
+    Rc<DxvkSampler>  m_emptySampler;
+
+    bool isBindingCurrent(uint32_t epoch) const {
+      return epoch == m_bindingEpoch.value;
+    }
+
+    const DxvkBufferSlice& getIndexBuffer() const {
+      return this->isBindingCurrent(m_bindingEpoch.indexBuffer)
+        ? m_state.vi.indexBuffer : m_emptyBufferSlice;
+    }
+
+    VkIndexType getIndexType() const {
+      return this->isBindingCurrent(m_bindingEpoch.indexBuffer)
+        ? m_state.vi.indexType : VK_INDEX_TYPE_UINT32;
+    }
+
+    const DxvkBufferSlice& getUniformBuffer(uint32_t slot) const {
+      return this->isBindingCurrent(m_bindingEpoch.uniformBuffers[slot])
+        ? m_uniformBuffers[slot] : m_emptyBufferSlice;
+    }
+
+    const DxvkViewPair& getResource(uint32_t slot) const {
+      return this->isBindingCurrent(m_bindingEpoch.resources[slot])
+        ? m_resources[slot] : m_emptyResource;
+    }
+
+    const Rc<DxvkSampler>& getSampler(uint32_t slot) const {
+      return this->isBindingCurrent(m_bindingEpoch.samplers[slot])
+        ? m_samplers[slot] : m_emptySampler;
+    }
+
+    const DxvkBufferSlice& getVertexBuffer(uint32_t binding) const {
+      return this->isBindingCurrent(m_bindingEpoch.vertexBuffers[binding])
+        ? m_state.vi.vertexBuffers[binding] : m_emptyBufferSlice;
+    }
+
+    uint32_t getVertexStride(uint32_t binding) const {
+      return this->isBindingCurrent(m_bindingEpoch.vertexBuffers[binding])
+        ? m_state.vi.vertexStrides[binding] : 0u;
+    }
+
+    const DxvkBufferSlice& getXfbBuffer(uint32_t binding) const {
+      return this->isBindingCurrent(m_bindingEpoch.xfbBuffers[binding])
+        ? m_state.xfb.buffers[binding] : m_emptyBufferSlice;
+    }
+
+    const DxvkBufferSlice& getXfbCounter(uint32_t binding) const {
+      return this->isBindingCurrent(m_bindingEpoch.xfbBuffers[binding])
+        ? m_state.xfb.counters[binding] : m_emptyBufferSlice;
+    }
+
+    bool materializeIndexBuffer() {
+      if (!this->isBindingCurrent(m_bindingEpoch.indexBuffer)) {
+        m_state.vi.indexBuffer = DxvkBufferSlice();
+        m_state.vi.indexType = VK_INDEX_TYPE_UINT32;
+        m_bindingEpoch.indexBuffer = m_bindingEpoch.value;
+        return false;
+      }
+
+      return true;
+    }
+
+    bool materializeUniformBuffer(uint32_t slot) {
+      if (!this->isBindingCurrent(m_bindingEpoch.uniformBuffers[slot])) {
+        m_uniformBuffers[slot] = DxvkBufferSlice();
+        m_bindingEpoch.uniformBuffers[slot] = m_bindingEpoch.value;
+        return false;
+      }
+
+      return true;
+    }
+
+    bool materializeVertexBuffer(uint32_t binding) {
+      if (!this->isBindingCurrent(m_bindingEpoch.vertexBuffers[binding])) {
+        m_state.vi.vertexBuffers[binding] = DxvkBufferSlice();
+        m_state.vi.vertexStrides[binding] = 0u;
+        m_bindingEpoch.vertexBuffers[binding] = m_bindingEpoch.value;
+        return false;
+      }
+
+      return true;
+    }
+
+    void dirtyBindingEpochState();
+    void drainBindingEpochState();
 
     std::array<DxvkGraphicsPipeline*, 4096> m_gpLookupCache = { };
     std::array<DxvkComputePipeline*,   256> m_cpLookupCache = { };

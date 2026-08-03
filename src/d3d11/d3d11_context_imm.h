@@ -106,6 +106,13 @@ namespace dxvk {
     void InjectCs(
             DxvkCsQueue                 Queue,
             Fn&&                        Command) {
+      // This intentionally bypasses the D3D11 EmitCs tail funnel: injected
+      // work is not a D3D11 command and can be ordered ahead of the current
+      // stream. All current callers are initialization, debug-name, or
+      // latency-tracker operations that do not bind or observe D3D11 context
+      // state. A future injected command that does either must use EmitCs (or
+      // explicitly consume the retained command-list tail under the context
+      // lock) instead of this escape hatch.
       auto chunk = AllocCsChunk();
       chunk->push(std::move(Command));
 
@@ -223,6 +230,18 @@ namespace dxvk {
     DxvkCsThread            m_csThread;
     uint64_t                m_csSeqNum = 0ull;
 
+    // Inline command-list replay may fold multiple logical CS chunks into
+    // one ordered queue entry. This offset keeps GpuFlushTracker's chunk
+    // cadence in the original logical timeline; resource waits keep using
+    // the physical CS sequence above.
+    uint64_t                m_heliosFlushChunkOffset = 0ull;
+
+    // A replay wrapper can own an entire deferred 16 KiB chunk. Keep the
+    // number of wrappers per immediate chunk bounded so high-priority CS
+    // work still gets a scheduling point at a fixed, small granularity.
+    uint32_t                m_heliosInlineReplayChunkCount = 0u;
+    static constexpr uint32_t MaxHeliosInlineReplayChunks = 16u;
+
     uint32_t                m_mappedImageCount = 0u;
 
     Rc<sync::CallbackFence> m_submissionFence;
@@ -303,11 +322,11 @@ namespace dxvk {
 
     uint64_t GetCurrentSequenceNumber();
 
+    uint64_t GetFlushTrackerChunkId();
+
     uint64_t GetPendingCsChunks();
 
     void ApplyDirtyNullBindings();
-
-    void HeliosNoteCsEmit();
 
     void ConsiderFlush(
             GpuFlushType                FlushType);

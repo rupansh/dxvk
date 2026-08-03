@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 
@@ -607,6 +608,29 @@ namespace dxvk {
     }
 
     /**
+     * \brief Marks this exact backing allocation as a present-sync producer
+     *
+     * The `(fence generation, Venus resource id)` pair is immutable for this
+     * publication. The marker is written only after its slot publication
+     * succeeded, then taken by the allocation destructor before it frees that
+     * memory.
+     */
+    bool setHeliosPresentSlot(uint32_t resid, uint32_t fenceId) {
+      if (!resid || !fenceId)
+        return false;
+
+      const uint64_t slot = (uint64_t(fenceId) << 32) | resid;
+      uint64_t expected = 0u;
+      return m_heliosPresentSlot.compare_exchange_strong(expected, slot,
+        std::memory_order_release, std::memory_order_acquire)
+          || expected == slot;
+    }
+
+    uint64_t takeHeliosPresentSlot() {
+      return m_heliosPresentSlot.exchange(0u, std::memory_order_acq_rel);
+    }
+
+    /**
      * \brief Queries buffer info
      * \returns Buffer info
      */
@@ -691,6 +715,7 @@ namespace dxvk {
     D3DKMT_HANDLE               m_kmtLocal = 0;
     D3DKMT_HANDLE               m_kmtGlobal = 0;
     bool                        m_ownsKmtHandles = false;
+    std::atomic<uint64_t>       m_heliosPresentSlot = { 0u };
 
     DxvkSparsePageTable*        m_sparsePageTable = nullptr;
 

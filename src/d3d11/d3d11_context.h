@@ -27,6 +27,12 @@ namespace dxvk {
   class D3D11DeferredContext;
   class D3D11ImmediateContext;
 
+  // The retained sampler cache deliberately covers the complete D3D11
+  // shader-stage/slot domain. Any future representation change must revisit
+  // the cache rather than silently retaining only a prefix of state.
+  static_assert(D3D11ShaderTypeCount == 6u);
+  static_assert(D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT == 16u);
+
   /**
    * \brief Helios command-list fast-path kill switch
    *
@@ -46,7 +52,123 @@ namespace dxvk {
   }
 
   /**
-   * \brief Helios: tail state of the immediate context's emitted CS stream
+   * \brief DDI-only deferred-context logical reset
+   *
+   * Default ON. This is separately marked by the Helios DDI bridge: public
+   * DXVK deferred contexts retain stock reset and lifetime behaviour. Set
+   * HELIOS_DXVK_DDI_LOGICAL_RESET=0 for a direct rollback.
+   */
+  inline bool heliosDdiLogicalReset() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_DDI_LOGICAL_RESET");
+      return !(env && env[0] == '0');
+    }();
+    return heliosClFastPath() && enabled;
+  }
+
+  /**
+   * \brief Helios command-list sampler-ref retention experiment
+   *
+   * Default OFF. `HELIOS_DXVK_CL_RETAIN_SAMPLER_REFS=1` retains a private
+   * reference per-context sampler slot across the BUILD_2 logical clear that
+   * follows FinishCommandList(FALSE) or ExecuteCommandList(FALSE).
+   * The API-visible state is still cleared; a matching later SetSamplers
+   * moves that retained reference back without an atomic AddRef/Release.
+   * This is deliberately subordinate to the command-list fast path, and is
+   * never used by ClearState or an ordinary context-state reset.
+   */
+  inline bool heliosClRetainSamplerRefs() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_CL_RETAIN_SAMPLER_REFS");
+      return env && env[0] != '0';
+    }();
+    return heliosClFastPath() && enabled;
+  }
+
+  /**
+   * \brief Helios command-list inline-replay experiment
+   *
+   * Default OFF. With the fast path enabled, setting
+   * `HELIOS_DXVK_CL_INLINE_REPLAY=1` replays one-chunk deferred command
+   * lists from the immediate context's open CS chunk instead of creating
+   * one CS-queue entry per list. The replay's final binding footprint is
+   * retained until the next execute boundary or ordinary CS command, so this
+   * changes transport granularity without exposing list state.
+   */
+  inline bool heliosClInlineReplay() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_CL_INLINE_REPLAY");
+      return env && env[0] != '0';
+    }();
+    return heliosClFastPath() && enabled;
+  }
+
+  /**
+   * \brief Helios command-list bulk cleanup experiment
+   *
+   * Default ON. `HELIOS_DXVK_CL_BULK_RESET=0` restores the scalar cleanup
+   * calls. The bulk form clears the same captured binding ranges and has the
+   * same final DXVK state and descriptor/pipeline dirty masks; it only folds
+   * repeated range-local dirty-bit updates into one operation.
+   */
+  inline bool heliosClBulkStateReset() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_CL_BULK_RESET");
+      return !(env && env[0] == '0');
+    }();
+    return enabled;
+  }
+
+  /**
+   * \brief Helios DDI command-list recycle cache
+   *
+   * Default ON. `HELIOS_DXVK_CL_RECYCLE_CACHE=0` still follows the BUILD_2
+   * recycle callback lifetime, but drops the retired command list at the
+   * deferred-context handoff instead of retaining it for the next recording.
+   * This is deliberately independent of the fast command-list path so a
+   * cache A/B does not alter command-stream semantics.
+   */
+  inline bool heliosClRecycleCache() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_CL_RECYCLE_CACHE");
+      return !(env && env[0] == '0');
+    }();
+    return enabled;
+  }
+
+  /**
+   * \brief Helios DDI command-list recycle-cache diagnostics
+   *
+   * Default OFF. `HELIOS_DXVK_CL_RECYCLE_STATS=1` logs per-deferred-context
+   * cache totals at actual context destruction. The counters are ordinary
+   * per-context integers and are never touched in a timed default run.
+   */
+  inline bool heliosClRecycleStats() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_CL_RECYCLE_STATS");
+      return env && env[0] != '0';
+    }();
+    return enabled;
+  }
+
+  /**
+   * \brief Helios command-list diagnostic counters
+   *
+   * Default OFF. `HELIOS_DXVK_CL_STATS=1` enables bounded per-device
+   * aggregate counters for a separate diagnostic run. Keeping this disabled
+   * for performance A/Bs avoids cross-thread atomic cache-line traffic from
+   * the runtime's millions of FinishCommandList calls.
+   */
+  inline bool heliosClStats() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_CL_STATS");
+      return env && env[0] != '0';
+    }();
+    return enabled;
+  }
+
+  /**
+   * \brief Helios: tail state of this context's emitted CS stream
    *
    * Tracks what the last CS-visible operation left the DXVK context's
    * binding state as, so redundant full reset sweeps can be elided at
@@ -61,10 +183,33 @@ namespace dxvk {
     /// list ending in its recorded trailing sweep) and nothing has been
     /// emitted since — another sweep would be redundant
     Clean       = 1,
-    /// The last CS-visible operation was a fast-path command list, which
-    /// carries no trailing sweep: its final bindings are still live on the
-    /// DXVK context and must be swept before any non-execute emission
+    /// A fast-path list left bindings live. The exact range that it touched
+    /// is retained alongside this state until the next execute boundary or
+    /// ordinary CS command consumes it.
     ClLeftover  = 2,
+  };
+
+  /**
+   * \brief Command-list isolation reset intent
+   *
+   * Logical binding resets may retain bounded DXVK binding references behind
+   * a new epoch. Physical resets are real application lifetime boundaries and
+   * must release those references. Keeping the intent explicit prevents a
+   * ClearState or context-state swap from accidentally taking the fast path.
+   */
+  enum class D3D11CommandListResetMode : uint32_t {
+    Physical,
+    LogicalBindings,
+  };
+
+  enum D3D11HeliosDdiLogicalScalar : uint16_t {
+    D3D11HeliosDdiIaLayout  = 1u << 0,
+    D3D11HeliosDdiIaIndex   = 1u << 1,
+    D3D11HeliosDdiOmDsv     = 1u << 2,
+    D3D11HeliosDdiOmBlend   = 1u << 3,
+    D3D11HeliosDdiOmDepth   = 1u << 4,
+    D3D11HeliosDdiRsState   = 1u << 5,
+    D3D11HeliosDdiPredicate = 1u << 6,
   };
 
   template<bool IsDeferred>
@@ -829,6 +974,18 @@ namespace dxvk {
     Rc<DxvkDevice>              m_device;
 
     D3D11ContextState           m_state;
+
+    // Enabled only through the UMD bridge for its private DDI deferred
+    // contexts. Active means m_state contains bounded retained ownership from
+    // earlier logical clears, while m_heliosDdiValidity marks current slots.
+    bool                        m_heliosDdiLogicalResetEnabled = false;
+    bool                        m_heliosDdiLogicalStateActive = false;
+    D3D11HeliosDdiLogicalState  m_heliosDdiValidity;
+
+    // Private references retained only by the opt-in BUILD_2 logical-reset
+    // path. Reusing D3D11SamplerBindings gives this cache exactly the active
+    // state's six-stage, 16-slot shape; it is never consulted by GetSamplers.
+    D3D11SamplerBindings        m_heliosRetainedSamplers;
     UINT                        m_flags;
 
     DxvkStagingBuffer           m_staging;
@@ -846,9 +1003,13 @@ namespace dxvk {
     // staged bind, and clears itself when a scan finds none bound.
     bool                        m_heliosStagedSrvSeen = false;
 
-    // Helios: CS-stream tail state for reset-sweep elision (immediate
-    // contexts only — the deferred instantiation never reads or writes it).
+    // Helios: CS-stream tail state for reset-sweep elision. Both immediate
+    // and deferred contexts record command-list boundaries, so each tracks
+    // the tail of its own stream independently. When the tail is
+    // ClLeftover, CPU D3D11 state may already have been logically cleared by
+    // ExecuteCommandList(FALSE), so m_state cannot reconstruct its footprint.
     D3D11HeliosCsState          m_heliosCsState = D3D11HeliosCsState::Unknown;
+    D3D11MaxUsedBindings         m_heliosCsLeftoverBindings = { };
 
     DxvkLocalAllocationCache    m_allocationCache;
 
@@ -1083,9 +1244,100 @@ namespace dxvk {
 
     void HeliosGateStagedSrvFreshness();
 
-    void ResetCommandListState();
+    void ResetCommandListState(
+      D3D11CommandListResetMode Mode = D3D11CommandListResetMode::Physical);
 
-    void ResetContextState();
+    /**
+     * \brief Consumes a command-list tail before another CS-visible command
+     *
+     * The retained footprint is exact for the command list that physically
+     * precedes this command. It must be swept before an ordinary command can
+     * observe its bindings. The template preserves EmitCs<false>'s no-flush
+     * contract when the sweep is inserted by that path.
+     */
+    void HeliosNoteCsEmit(bool AllowFlush);
+
+    void SetHeliosClLeftover(const D3D11MaxUsedBindings& UsedBindings) {
+      m_heliosCsLeftoverBindings = UsedBindings;
+      m_heliosCsState = D3D11HeliosCsState::ClLeftover;
+    }
+
+    void EmitCommandListStateReset(
+      const D3D11MaxUsedBindings&       UsedBindings,
+            D3D11CommandListResetMode    Mode,
+            bool                         AllowFlush = true);
+
+    // RetainSamplerRefs is valid only for the explicitly selected
+    // ExecuteCommandList(FALSE)/FinishCommandList(FALSE) transitions. All
+    // ordinary reset paths drain both active and retained private refs.
+    void ResetContextState(bool RetainSamplerRefs = false);
+
+    // DDI-only Finish(FALSE) fast path. This clears logical state and fixed
+    // validity maps without releasing retained slot ownership. Normal reset
+    // paths still drain every private reference.
+    void ResetHeliosDdiLogicalState();
+
+    template<uint32_t Size>
+    bool HeliosDdiSlotWasInvalid(D3D11HeliosLogicalSlots<Size>& slots, uint32_t slot) {
+      if constexpr (!IsDeferred)
+        return false;
+
+      if (likely(!m_heliosDdiLogicalStateActive)
+       || likely(slots.test(slot, m_heliosDdiValidity.generation)))
+        return false;
+
+      slots.set(slot, m_heliosDdiValidity.generation);
+      return true;
+    }
+
+    template<uint32_t Size>
+    bool HeliosDdiSlotIsValid(const D3D11HeliosLogicalSlots<Size>& slots, uint32_t slot) const {
+      if constexpr (!IsDeferred)
+        return true;
+
+      return !m_heliosDdiLogicalStateActive
+        || slots.test(slot, m_heliosDdiValidity.generation);
+    }
+
+    bool HeliosDdiScalarWasInvalid(uint16_t bit) {
+      if constexpr (!IsDeferred)
+        return false;
+
+      if (likely(!m_heliosDdiLogicalStateActive) || likely(m_heliosDdiValidity.scalarMask & bit))
+        return false;
+
+      m_heliosDdiValidity.scalarMask |= bit;
+      return true;
+    }
+
+    bool HeliosDdiScalarIsValid(uint16_t bit) const {
+      if constexpr (!IsDeferred)
+        return true;
+
+      return !m_heliosDdiLogicalStateActive || (m_heliosDdiValidity.scalarMask & bit);
+    }
+
+    bool HeliosDdiShaderWasInvalid(D3D11ShaderType stage) {
+      if constexpr (!IsDeferred)
+        return false;
+
+      uint32_t bit = 1u << uint32_t(stage);
+      if (likely(!m_heliosDdiLogicalStateActive) || likely(m_heliosDdiValidity.shaderMask & bit))
+        return false;
+
+      m_heliosDdiValidity.shaderMask |= bit;
+      return true;
+    }
+
+    bool HeliosDdiShaderIsValid(D3D11ShaderType stage) const {
+      if constexpr (!IsDeferred)
+        return true;
+
+      return !m_heliosDdiLogicalStateActive
+        || (m_heliosDdiValidity.shaderMask & (1u << uint32_t(stage)));
+    }
+
+    void RetainHeliosSamplerRefs();
 
     void ResetDirtyTracking();
 
@@ -1253,13 +1505,11 @@ namespace dxvk {
 
     template<bool AllowFlush = true, typename Cmd>
     void EmitCs(Cmd&& command) {
-      // Helios: every CS-visible command funnels through here or EmitCsCmd,
-      // so this is where a fast-path command list's leftover bindings get
-      // swept before anything else can observe them.
-      if constexpr (!IsDeferred) {
-        if (unlikely(m_heliosCsState != D3D11HeliosCsState::Unknown))
-          GetTypedContext()->HeliosNoteCsEmit();
-      }
+      // Every CS-visible command funnels through here or EmitCsCmd. In
+      // particular, a deferred parent must consume a nested child's retained
+      // tail before it records its own next command.
+      if (unlikely(m_heliosCsState != D3D11HeliosCsState::Unknown))
+        HeliosNoteCsEmit(AllowFlush);
 
       if (unlikely(m_csDataType != D3D11CmdType::None)) {
         m_csData = nullptr;
@@ -1279,11 +1529,10 @@ namespace dxvk {
 
     template<typename M, bool AllowFlush = true, typename Cmd>
     void EmitCsCmd(D3D11CmdType type, size_t count, Cmd&& command) {
-      // Helios: see EmitCs — same funnel, same leftover-state sweep.
-      if constexpr (!IsDeferred) {
-        if (unlikely(m_heliosCsState != D3D11HeliosCsState::Unknown))
-          GetTypedContext()->HeliosNoteCsEmit();
-      }
+      // See EmitCs. Cmd-buffer payloads are equally CS-visible state from
+      // the viewpoint of a later nested command-list execution.
+      if (unlikely(m_heliosCsState != D3D11HeliosCsState::Unknown))
+        HeliosNoteCsEmit(AllowFlush);
 
       m_csDataType = type;
       m_csData = m_csChunk->pushCmd<M, Cmd>(command, count);

@@ -350,6 +350,79 @@ namespace dxvk {
 
   using D3D11ClassInstances = D3D11ShaderStageState<D3D11ClassInstanceState>;
 
+  /**
+   * \brief Validity bits for a DDI-only logical deferred-context clear
+   *
+   * A FinishCommandList(FALSE) clear is observable as default D3D11 state,
+   * but the DDI frontend creates several million lists in a Fire Strike run.
+   * Releasing every private reference in the state table at that boundary is
+   * prohibitively expensive. The actual references remain in the fixed-size
+   * table until an ordinary lifetime boundary drains them. Slot generation
+   * tags distinguish the current logical state from retained stale slots
+   * without clearing a 6x256 / 6x128 bitset on every Finish(FALSE).
+   */
+  template<uint32_t Size>
+  struct D3D11HeliosLogicalSlots {
+    std::array<uint32_t, Size> generation = { };
+
+    bool test(uint32_t slot, uint32_t current) const {
+      return generation[slot] == current;
+    }
+
+    void set(uint32_t slot, uint32_t current) {
+      generation[slot] = current;
+    }
+
+    // Reached only when the context's 32-bit logical-state epoch wraps.
+    void clear() {
+      generation.fill(0u);
+    }
+  };
+
+  struct D3D11HeliosDdiLogicalState {
+    uint32_t generation = 0u;
+    uint32_t shaderMask = 0u;
+
+    D3D11ShaderStageState<D3D11HeliosLogicalSlots<D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT>> cbv;
+    D3D11ShaderStageState<D3D11HeliosLogicalSlots<D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>> srv;
+    D3D11ShaderStageState<D3D11HeliosLogicalSlots<D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT>> samplers;
+    D3D11ShaderStageState<D3D11HeliosLogicalSlots<D3D11ClassInstanceState::MaxInstances>> instances;
+
+    D3D11HeliosLogicalSlots<D3D11_1_UAV_SLOT_COUNT> uav;
+    D3D11HeliosLogicalSlots<D3D11_1_UAV_SLOT_COUNT> omUav;
+    D3D11HeliosLogicalSlots<D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> rtv;
+    D3D11HeliosLogicalSlots<D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexBuffer;
+    D3D11HeliosLogicalSlots<D3D11_SO_BUFFER_SLOT_COUNT> so;
+
+    uint16_t scalarMask = 0u;
+
+    // O(1): used at hard state boundaries and after an epoch transition.
+    void reset() {
+      shaderMask = 0u;
+      scalarMask = 0u;
+    }
+
+    // O(1) for every practical Finish(FALSE). On wrap, clear every tag before
+    // reusing epoch 1 so a four-billion-list run cannot resurrect stale state.
+    void advance() {
+      generation += 1u;
+
+      if (!generation) {
+        for (uint32_t i = 0u; i < D3D11ShaderTypeCount; i++) {
+          auto stage = D3D11ShaderType(i);
+          cbv[stage].clear();
+          srv[stage].clear();
+          samplers[stage].clear();
+          instances[stage].clear();
+        }
+        uav.clear(); omUav.clear(); rtv.clear(); vertexBuffer.clear(); so.clear();
+        generation = 1u;
+      }
+
+      reset();
+    }
+  };
+
   
   /**
    * \brief Context state

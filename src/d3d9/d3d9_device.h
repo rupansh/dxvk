@@ -1203,8 +1203,8 @@ namespace dxvk {
     }
 
     DxvkCsChunkRef AllocCsChunk() {
-      DxvkCsChunk* chunk = m_csChunkPool.allocChunk(DxvkCsChunkFlag::SingleUse);
-      return DxvkCsChunkRef(chunk, &m_csChunkPool);
+      auto allocation = m_csChunkPool.allocChunk(DxvkCsChunkFlag::SingleUse);
+      return DxvkCsChunkRef(allocation.chunk, &m_csChunkPool, allocation.shard);
     }
 
     bool Is9On12Device() const {

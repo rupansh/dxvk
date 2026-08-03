@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <vector>
 #include <utility>
@@ -83,6 +84,60 @@ namespace dxvk {
   
   DxvkContext::~DxvkContext() {
     
+  }
+
+
+  void DxvkContext::resetBindingEpoch() {
+    if (unlikely(m_bindingEpoch.value == std::numeric_limits<uint32_t>::max()))
+      this->drainBindingEpochState();
+    else
+      m_bindingEpoch.value += 1u;
+
+    this->dirtyBindingEpochState();
+  }
+
+
+  void DxvkContext::resetBindingEpochAndDrain() {
+    this->drainBindingEpochState();
+    this->dirtyBindingEpochState();
+  }
+
+
+  void DxvkContext::dirtyBindingEpochState() {
+    m_descriptorState.dirtyStages(
+      VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT);
+
+    m_flags.set(
+      DxvkContextFlag::GpDirtyIndexBuffer,
+      DxvkContextFlag::GpDirtyVertexBuffers,
+      DxvkContextFlag::GpDirtyXfbBuffers);
+  }
+
+
+  void DxvkContext::drainBindingEpochState() {
+    m_state.vi.indexBuffer = DxvkBufferSlice();
+    m_state.vi.indexType = VK_INDEX_TYPE_UINT32;
+
+    for (auto& buffer : m_uniformBuffers)
+      buffer = DxvkBufferSlice();
+
+    for (auto& resource : m_resources)
+      resource = DxvkViewPair();
+
+    for (auto& sampler : m_samplers)
+      sampler = nullptr;
+
+    for (uint32_t i = 0u; i < MaxNumVertexBindings; i++) {
+      m_state.vi.vertexBuffers[i] = DxvkBufferSlice();
+      m_state.vi.vertexStrides[i] = 0u;
+    }
+
+    for (uint32_t i = 0u; i < MaxNumXfbBuffers; i++) {
+      m_state.xfb.buffers[i] = DxvkBufferSlice();
+      m_state.xfb.counters[i] = DxvkBufferSlice();
+    }
+
+    m_bindingEpoch = DxvkBindingEpochState();
   }
   
   
@@ -6582,7 +6637,7 @@ namespace dxvk {
       VkDeviceSize ctrOffsets[MaxNumXfbBuffers];
 
       for (uint32_t i = 0; i < MaxNumXfbBuffers; i++) {
-        m_state.xfb.activeCounters[i] = m_state.xfb.counters[i];
+        m_state.xfb.activeCounters[i] = this->getXfbCounter(i);
         auto bufferSlice = m_state.xfb.activeCounters[i].getSliceInfo();
 
         ctrBuffers[i] = bufferSlice.buffer;
@@ -7063,7 +7118,7 @@ namespace dxvk {
           auto& descriptorInfo = m_legacyDescriptors.infos[descriptorCount++];
 
           if (binding.isUniformBuffer()) {
-            const auto& slice = m_uniformBuffers[binding.getResourceIndex()];
+            const auto& slice = this->getUniformBuffer(binding.getResourceIndex());
 
             if (slice.length()) {
               auto bufferInfo = slice.getSliceInfo();
@@ -7080,7 +7135,7 @@ namespace dxvk {
           } else {
             switch (binding.getDescriptorType()) {
               case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: {
-                const auto& res = m_resources[binding.getResourceIndex()];
+                const auto& res = this->getResource(binding.getResourceIndex());
                 const DxvkDescriptor* descriptor = nullptr;
 
                 if (res.imageView)
@@ -7109,7 +7164,7 @@ namespace dxvk {
               } break;
 
               case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
-                const auto& res = m_resources[binding.getResourceIndex()];
+                const auto& res = this->getResource(binding.getResourceIndex());
                 const DxvkDescriptor* descriptor = nullptr;
 
                 if (res.imageView)
@@ -7127,7 +7182,7 @@ namespace dxvk {
               } break;
 
               case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: {
-                const auto& res = m_resources[binding.getResourceIndex()];
+                const auto& res = this->getResource(binding.getResourceIndex());
                 const DxvkDescriptor* descriptor = nullptr;
 
                 if (res.bufferView)
@@ -7143,7 +7198,7 @@ namespace dxvk {
               } break;
 
               case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
-                const auto& res = m_resources[binding.getResourceIndex()];
+                const auto& res = this->getResource(binding.getResourceIndex());
                 const DxvkDescriptor* descriptor = nullptr;
 
                 if (res.bufferView)
@@ -7159,7 +7214,7 @@ namespace dxvk {
               } break;
 
               case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: {
-                const auto& res = m_resources[binding.getResourceIndex()];
+                const auto& res = this->getResource(binding.getResourceIndex());
                 const DxvkDescriptor* descriptor = nullptr;
 
                 if (res.bufferView)
@@ -7177,7 +7232,7 @@ namespace dxvk {
               } break;
 
               case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
-                const auto& res = m_resources[binding.getResourceIndex()];
+                const auto& res = this->getResource(binding.getResourceIndex());
                 const DxvkDescriptor* descriptor = nullptr;
 
                 if (res.bufferView)
@@ -7342,7 +7397,7 @@ namespace dxvk {
         const auto& binding = range.bindings[j];
 
         if (binding.isUniformBuffer()) {
-          const auto& slice = m_uniformBuffers[binding.getResourceIndex()];
+          const auto& slice = this->getUniformBuffer(binding.getResourceIndex());
           auto sliceInfo = slice.getSliceInfo();
 
           auto& buffer = e.buffers[bufferCount++];
@@ -7354,7 +7409,7 @@ namespace dxvk {
           if (likely(sliceInfo.size))
             trackUniformBufferBinding<TrackBindings>(binding, slice);
         } else {
-          const auto& res = m_resources[binding.getResourceIndex()];
+          const auto& res = this->getResource(binding.getResourceIndex());
 
           switch (binding.getDescriptorType()) {
             case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: {
@@ -7493,12 +7548,12 @@ namespace dxvk {
 
       for (uint32_t i = 0u; i < range.bindingCount; i++) {
         const auto& binding = range.bindings[i];
-        const auto& res = m_resources[binding.getResourceIndex()];
+        const auto& res = this->getResource(binding.getResourceIndex());
 
         VkDeviceAddress va = 0u;
 
         if (binding.isUniformBuffer()) {
-          const auto& slice = m_uniformBuffers[binding.getResourceIndex()];
+          const auto& slice = this->getUniformBuffer(binding.getResourceIndex());
 
           if (slice.length()) {
             va = slice.getSliceInfo().gpuAddress;
@@ -7525,7 +7580,7 @@ namespace dxvk {
 
       for (uint32_t i = 0u; i < range.bindingCount; i++) {
         const auto& binding = range.bindings[i];
-        const auto& sampler = m_samplers[binding.getResourceIndex()];
+        const auto& sampler = this->getSampler(binding.getResourceIndex());
 
         uint16_t index = 0u;
 
@@ -7739,29 +7794,32 @@ namespace dxvk {
   void DxvkContext::updateIndexBufferBinding() {
     m_flags.clr(DxvkContextFlag::GpDirtyIndexBuffer);
 
-    if (likely(m_state.vi.indexBuffer.length())) {
-      auto bufferInfo = m_state.vi.indexBuffer.getSliceInfo();
+    const auto& indexBuffer = this->getIndexBuffer();
+    VkIndexType indexType = this->getIndexType();
 
-      VkDeviceSize align = m_state.vi.indexType == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+    if (likely(indexBuffer.length())) {
+      auto bufferInfo = indexBuffer.getSliceInfo();
+
+      VkDeviceSize align = indexType == VK_INDEX_TYPE_UINT16 ? 2 : 4;
       VkDeviceSize length = bufferInfo.size & ~(align - 1);
 
       m_cmd->cmdBindIndexBuffer2(
         bufferInfo.buffer, bufferInfo.offset,
-        length, m_state.vi.indexType);
+        length, indexType);
 
       if (m_flags.test(DxvkContextFlag::GpRenderPassUnsynchronized)
-       || m_state.vi.indexBuffer.buffer()->hasGfxStores()) {
-        accessBuffer(DxvkCmdBuffer::ExecBuffer, m_state.vi.indexBuffer,
+       || indexBuffer.buffer()->hasGfxStores()) {
+        accessBuffer(DxvkCmdBuffer::ExecBuffer, indexBuffer,
           VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_INDEX_READ_BIT, DxvkAccessOp::None);
       }
 
       m_renderPassBarrierSrc.stages |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
       m_renderPassBarrierSrc.access |= VK_ACCESS_INDEX_READ_BIT;
 
-      m_cmd->track(m_state.vi.indexBuffer.buffer(), DxvkAccess::Read);
+      m_cmd->track(indexBuffer.buffer(), DxvkAccess::Read);
     } else {
       // Bind null index buffer to read all zeroes, not too useful but well-defined
-      m_cmd->cmdBindIndexBuffer2(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE, m_state.vi.indexType);
+      m_cmd->cmdBindIndexBuffer2(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE, indexType);
     }
   }
   
@@ -7783,14 +7841,15 @@ namespace dxvk {
     // Set buffer handles and offsets for active bindings
     for (uint32_t i = 0; i < m_state.gp.state.il.bindingCount(); i++) {
       uint32_t binding = m_state.gp.state.ilBindings[i].binding();
+      const auto& vertexBuffer = this->getVertexBuffer(binding);
       
-      if (likely(m_state.vi.vertexBuffers[binding].length())) {
-        auto vbo = m_state.vi.vertexBuffers[binding].getSliceInfo();
+      if (likely(vertexBuffer.length())) {
+        auto vbo = vertexBuffer.getSliceInfo();
         
         buffers[i] = vbo.buffer;
         offsets[i] = vbo.offset;
         lengths[i] = vbo.size;
-        strides[i] = m_state.vi.vertexStrides[binding];
+        strides[i] = this->getVertexStride(binding);
 
         if (strides[i]) {
           // Dynamic strides are only allowed if the stride is not smaller
@@ -7799,12 +7858,12 @@ namespace dxvk {
         }
 
         if (m_flags.test(DxvkContextFlag::GpRenderPassUnsynchronized)
-         || m_state.vi.vertexBuffers[binding].buffer()->hasGfxStores()) {
-          accessBuffer(DxvkCmdBuffer::ExecBuffer, m_state.vi.vertexBuffers[binding],
+         || vertexBuffer.buffer()->hasGfxStores()) {
+          accessBuffer(DxvkCmdBuffer::ExecBuffer, vertexBuffer,
             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT, DxvkAccessOp::None);
         }
 
-        m_cmd->track(m_state.vi.vertexBuffers[binding].buffer(), DxvkAccess::Read);
+        m_cmd->track(vertexBuffer.buffer(), DxvkAccess::Read);
       } else {
         buffers[i] = VK_NULL_HANDLE;
         offsets[i] = 0;
@@ -7848,7 +7907,8 @@ namespace dxvk {
     VkDeviceSize xfbLengths[MaxNumXfbBuffers];
 
     for (size_t i = 0; i < MaxNumXfbBuffers; i++) {
-      auto bufferSlice = m_state.xfb.buffers[i].getSliceInfo();
+      const auto& xfbBuffer = this->getXfbBuffer(i);
+      auto bufferSlice = xfbBuffer.getSliceInfo();
       
       xfbBuffers[i] = bufferSlice.buffer;
       xfbOffsets[i] = bufferSlice.offset;
@@ -7858,10 +7918,10 @@ namespace dxvk {
         xfbBuffers[i] = m_common->dummyResources().bufferInfo().buffer;
 
       if (bufferSlice.buffer) {
-        Rc<DxvkBuffer> buffer = m_state.xfb.buffers[i].buffer();
+        Rc<DxvkBuffer> buffer = xfbBuffer.buffer();
         buffer->setXfbVertexStride(gsInfo.xfbStrides[i]);
 
-        accessBuffer(DxvkCmdBuffer::ExecBuffer, m_state.xfb.buffers[i],
+        accessBuffer(DxvkCmdBuffer::ExecBuffer, xfbBuffer,
           VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT,
           VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT, DxvkAccessOp::None);
 
@@ -8408,7 +8468,7 @@ namespace dxvk {
 
         for (uint32_t j = 0u; j < range.bindingCount; j++) {
           const auto& binding = range.bindings[j];
-          const auto& slot = m_resources[binding.getResourceIndex()];
+          const auto& slot = this->getResource(binding.getResourceIndex());
 
           switch (binding.getDescriptorType()) {
             case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
@@ -8480,7 +8540,7 @@ namespace dxvk {
           case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
           case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
             if (binding.isUniformBuffer()) {
-              const auto& slot = m_uniformBuffers[binding.getResourceIndex()];
+              const auto& slot = this->getUniformBuffer(binding.getResourceIndex());
 
               if (slot.length() && (checkEverything || slot.buffer()->hasGfxStores())) {
                 if (checkBufferBarrier<BindPoint>(slot, binding.getAccess(), DxvkAccessOp::None))
@@ -8492,7 +8552,7 @@ namespace dxvk {
 
           case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
           case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
-            const auto& slot = m_resources[binding.getResourceIndex()];
+            const auto& slot = this->getResource(binding.getResourceIndex());
 
             if (slot.bufferView && (checkEverything || slot.bufferView->buffer()->hasGfxStores())) {
               if (checkBufferViewBarrier<BindPoint>(slot.bufferView, binding.getAccess(), DxvkAccessOp::None))
@@ -8502,7 +8562,7 @@ namespace dxvk {
 
           case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
           case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
-            const auto& slot = m_resources[binding.getResourceIndex()];
+            const auto& slot = this->getResource(binding.getResourceIndex());
 
             if (slot.imageView && (checkEverything || slot.imageView->hasGfxStores())) {
               if (checkImageViewBarrier<BindPoint>(slot.imageView, binding.getAccess(), DxvkAccessOp::None))
@@ -8559,8 +8619,8 @@ namespace dxvk {
     if (m_flags.test(DxvkContextFlag::GpDirtyXfbBuffers)
      && m_state.gp.flags.test(DxvkGraphicsPipelineFlag::HasTransformFeedback)) {
       for (uint32_t i = 0; i < MaxNumXfbBuffers; i++) {
-        const auto& xfbBufferSlice = m_state.xfb.buffers[i];
-        const auto& xfbCounterSlice = m_state.xfb.counters[i];
+        const auto& xfbBufferSlice = this->getXfbBuffer(i);
+        const auto& xfbCounterSlice = this->getXfbCounter(i);
 
         if (xfbBufferSlice.length()) {
           requiresBarrier |= !xfbBufferSlice.buffer()->trackGfxStores();
@@ -8605,7 +8665,7 @@ namespace dxvk {
     // This does not extend to indirect draw buffers.
     if (m_execBarriers.hasTargetAccess(VK_ACCESS_2_INDEX_READ_BIT) && Indexed
      && m_flags.test(DxvkContextFlag::GpDirtyIndexBuffer)) {
-      const auto& indexBufferSlice = m_state.vi.indexBuffer;
+      const auto& indexBufferSlice = this->getIndexBuffer();
 
       if (indexBufferSlice.length() && (unsynchronizedPass || indexBufferSlice.buffer()->hasGfxStores())) {
         if (checkBufferBarrier<VK_PIPELINE_BIND_POINT_GRAPHICS>(indexBufferSlice,
@@ -8620,7 +8680,7 @@ namespace dxvk {
 
       for (uint32_t i = 0; i < bindingCount; i++) {
         uint32_t binding = m_state.gp.state.ilBindings[i].binding();
-        const auto& vertexBufferSlice = m_state.vi.vertexBuffers[binding];
+        const auto& vertexBufferSlice = this->getVertexBuffer(binding);
 
         if (vertexBufferSlice.length() && (unsynchronizedPass || vertexBufferSlice.buffer()->hasGfxStores())) {
           if (checkBufferBarrier<VK_PIPELINE_BIND_POINT_GRAPHICS>(vertexBufferSlice,

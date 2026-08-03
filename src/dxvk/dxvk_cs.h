@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -361,6 +362,14 @@ namespace dxvk {
   class DxvkCsChunkPool {
     
   public:
+
+    static constexpr uint32_t ShardCount = 64u;
+    static_assert((ShardCount & (ShardCount - 1u)) == 0u);
+
+    struct Allocation {
+      DxvkCsChunk* chunk;
+      uint32_t     shard;
+    };
     
     DxvkCsChunkPool();
     ~DxvkCsChunkPool();
@@ -376,7 +385,7 @@ namespace dxvk {
      * \param [in] flags Chunk flags
      * \returns Allocated chunk object
      */
-    DxvkCsChunk* allocChunk(DxvkCsChunkFlags flags);
+    Allocation allocChunk(DxvkCsChunkFlags flags);
     
     /**
      * \brief Releases a chunk
@@ -384,12 +393,28 @@ namespace dxvk {
      * Resets the chunk and adds it to the pool.
      * \param [in] chunk Chunk to release
      */
-    void freeChunk(DxvkCsChunk* chunk);
+    void freeChunk(
+            DxvkCsChunk* chunk,
+            uint32_t     shard);
     
   private:
-    
-    dxvk::mutex               m_mutex;
-    std::vector<DxvkCsChunk*> m_chunks;
+
+    /**
+     * \brief Per-producer allocation shard
+     *
+     * Chunks are always returned to the shard that allocated them. Apart
+     * from reducing producer contention, this means the destination of a
+     * last-reference release is independent of the thread that releases it.
+     */
+    struct alignas(64) Shard {
+      dxvk::mutex               mutex;
+      std::vector<DxvkCsChunk*> chunks;
+    };
+
+    uint32_t pickShard() const;
+
+    std::array<Shard, ShardCount> m_shards;
+    uint32_t                      m_shardMask;
     
   };
   
@@ -408,23 +433,28 @@ namespace dxvk {
     DxvkCsChunkRef() { }
     DxvkCsChunkRef(
       DxvkCsChunk*      chunk,
-      DxvkCsChunkPool*  pool)
+      DxvkCsChunkPool*  pool,
+      uint32_t          shard)
     : m_chunk (chunk),
-      m_pool  (pool) {
+      m_pool  (pool),
+      m_shard (shard) {
       this->incRef();
     }
     
     DxvkCsChunkRef(const DxvkCsChunkRef& other)
     : m_chunk (other.m_chunk),
-      m_pool  (other.m_pool) {
+      m_pool  (other.m_pool),
+      m_shard (other.m_shard) {
       this->incRef();
     }
     
     DxvkCsChunkRef(DxvkCsChunkRef&& other)
     : m_chunk (other.m_chunk),
-      m_pool  (other.m_pool) {
+      m_pool  (other.m_pool),
+      m_shard (other.m_shard) {
       other.m_chunk = nullptr;
       other.m_pool  = nullptr;
+      other.m_shard = 0u;
     }
     
     DxvkCsChunkRef& operator = (const DxvkCsChunkRef& other) {
@@ -432,6 +462,7 @@ namespace dxvk {
       this->decRef();
       this->m_chunk = other.m_chunk;
       this->m_pool  = other.m_pool;
+      this->m_shard = other.m_shard;
       return *this;
     }
     
@@ -439,8 +470,10 @@ namespace dxvk {
       this->decRef();
       this->m_chunk = other.m_chunk;
       this->m_pool  = other.m_pool;
+      this->m_shard = other.m_shard;
       other.m_chunk = nullptr;
       other.m_pool  = nullptr;
+      other.m_shard = 0u;
       return *this;
     }
     
@@ -460,6 +493,7 @@ namespace dxvk {
     
     DxvkCsChunk*      m_chunk = nullptr;
     DxvkCsChunkPool*  m_pool  = nullptr;
+    uint32_t          m_shard = 0u;
     
     void incRef() const {
       if (m_chunk != nullptr)
@@ -468,7 +502,7 @@ namespace dxvk {
     
     void decRef() const {
       if (m_chunk != nullptr && m_chunk->decRef() == 0)
-        m_pool->freeChunk(m_chunk);
+        m_pool->freeChunk(m_chunk, m_shard);
     }
     
   };
