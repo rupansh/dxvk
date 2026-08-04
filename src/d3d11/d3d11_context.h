@@ -67,38 +67,60 @@ namespace dxvk {
   }
 
   /**
-   * \brief Helios command-list sampler-ref retention experiment
+   * \brief Helios command-list sampler-ref retention
    *
-   * Default OFF. `HELIOS_DXVK_CL_RETAIN_SAMPLER_REFS=1` retains a private
-   * reference per-context sampler slot across the BUILD_2 logical clear that
-   * follows FinishCommandList(FALSE) or ExecuteCommandList(FALSE).
-   * The API-visible state is still cleared; a matching later SetSamplers
-   * moves that retained reference back without an atomic AddRef/Release.
-   * This is deliberately subordinate to the command-list fast path, and is
-   * never used by ClearState or an ordinary context-state reset.
+   * **Default ON since 2026-08-05.** It retains a private reference per-context
+   * sampler slot across the BUILD_2 logical clear that follows
+   * FinishCommandList(FALSE) or ExecuteCommandList(FALSE). The API-visible
+   * state is still cleared; a matching later SetSamplers moves that retained
+   * reference back without an atomic AddRef/Release. This is deliberately
+   * subordinate to the command-list fast path, and is never used by ClearState
+   * or an ordinary context-state reset.
+   *
+   * This is the single largest lever in the whole command-list path, and it
+   * shipped OFF by mistake: sampler private-reference teardown — not command
+   * lists in general — was the historical sub-50 fps failure mode. A
+   * same-build, same-boot isolation sweep (2026-08-03) moved GT1 from
+   * **53.609 to 181.938 fps** by setting only this variable
+   * (`tmp/perf/gt1-18eb-000-r1.txt` vs `gt1-18eb-001-r1.txt`; analysis in
+   * `tmp/handoff-perf-structural/reports/p3-227-recovery-outcome.md`). Every
+   * accepted score since has run with it on, supplied by the test VM's
+   * registry — so the code default disagreeing with it meant a fresh install
+   * shipped the slow path.
+   *
+   * `HELIOS_DXVK_CL_RETAIN_SAMPLER_REFS=0` is the A/B disable.
    */
   inline bool heliosClRetainSamplerRefs() {
     static const bool enabled = [] {
       const char* env = std::getenv("HELIOS_DXVK_CL_RETAIN_SAMPLER_REFS");
-      return env && env[0] != '0';
+      return !(env && env[0] == '0');
     }();
     return heliosClFastPath() && enabled;
   }
 
   /**
-   * \brief Helios command-list inline-replay experiment
+   * \brief Helios command-list inline replay
    *
-   * Default OFF. With the fast path enabled, setting
-   * `HELIOS_DXVK_CL_INLINE_REPLAY=1` replays one-chunk deferred command
-   * lists from the immediate context's open CS chunk instead of creating
-   * one CS-queue entry per list. The replay's final binding footprint is
-   * retained until the next execute boundary or ordinary CS command, so this
-   * changes transport granularity without exposing list state.
+   * **Default ON since 2026-08-05.** With the fast path enabled, one-chunk
+   * deferred command lists are replayed from the immediate context's open CS
+   * chunk instead of creating one CS-queue entry per list. The replay's final
+   * binding footprint is retained until the next execute boundary or ordinary
+   * CS command, so this changes transport granularity without exposing list
+   * state.
+   *
+   * It removes the remaining per-list CS-queue dispatch, which is the dominant
+   * transport cost when the runtime hands us millions of tiny lists: in the
+   * accepted 224.964 fps run, **1,830,697 of 1,841,743 executes were one-chunk
+   * inline admissions** (`tmp/handoff-perf-structural/reports/p3-227-recovery-outcome.md`).
+   * Like the sampler retention above, it was ON in every accepted run via the
+   * test VM's registry while the code default said OFF.
+   *
+   * `HELIOS_DXVK_CL_INLINE_REPLAY=0` is the A/B disable.
    */
   inline bool heliosClInlineReplay() {
     static const bool enabled = [] {
       const char* env = std::getenv("HELIOS_DXVK_CL_INLINE_REPLAY");
-      return env && env[0] != '0';
+      return !(env && env[0] == '0');
     }();
     return heliosClFastPath() && enabled;
   }

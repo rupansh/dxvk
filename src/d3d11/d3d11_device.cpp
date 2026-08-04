@@ -37,9 +37,14 @@
 namespace dxvk {
 
   namespace {
+    // Default ON. Helios shared resources are always KMT-only: the UMD is the
+    // only thing that hosts this engine, and it used to force
+    // HELIOS_DXVK_KMT_SHARED=1 into its own environment before any DXVK device
+    // existed, so this could not be false in any shipping configuration. The
+    // env var survives only as the `=0` disable for a standalone DXVK build.
     bool heliosKmtOnlySharedResources() {
       const char* value = std::getenv("HELIOS_DXVK_KMT_SHARED");
-      return value && value[0] == '1' && value[1] == '\0';
+      return !(value && value[0] == '0');
     }
   }
   
