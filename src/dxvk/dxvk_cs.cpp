@@ -1,4 +1,5 @@
 #include "dxvk_cs.h"
+#include "dxvk_helios_feed_trace.h"
 
 #include <cstdlib>
 
@@ -163,6 +164,9 @@ namespace dxvk {
       entry.chunk = std::move(chunk);
       entry.seq = seq;
 
+      helios_feed::csChunkEnqueued(
+        m_queueOrdered.queue.size() + m_queueHighPrio.queue.size());
+
       m_condOnAdd.notify_one();
     }
     
@@ -182,6 +186,9 @@ namespace dxvk {
       auto& entry = q.queue.emplace_back();
       entry.chunk = std::move(chunk);
       entry.seq = timeline;
+
+      helios_feed::csChunkEnqueued(
+        m_queueOrdered.queue.size() + m_queueHighPrio.queue.size());
 
       m_condOnAdd.notify_one();
 
@@ -232,6 +239,8 @@ namespace dxvk {
   void DxvkCsThread::threadFunc() {
     env::setThreadName("dxvk-cs");
 
+    const bool traceFeed = helios_feed::enabled();
+
     // Local chunk queues, we use two queues and swap between
     // them in order to potentially reduce lock contention.
     std::vector<DxvkCsQueuedChunk> ordered;
@@ -256,10 +265,18 @@ namespace dxvk {
 
             auto t1 = dxvk::high_resolution_clock::now();
             m_device->addStatCtr(DxvkStatCounter::CsIdleTicks, std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+
+            if (traceFeed)
+              helios_feed::csWorkerIdle(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
           }
 
+          const size_t dequeued = m_queueOrdered.queue.size()
+            + m_queueHighPrio.queue.size();
           std::swap(ordered, m_queueOrdered.queue);
           std::swap(highPrio, m_queueHighPrio.queue);
+
+          if (traceFeed && dequeued)
+            helios_feed::csChunkDequeued(dequeued, 0u);
 
           m_hasHighPrio.store(false);
         }
@@ -275,7 +292,11 @@ namespace dxvk {
             highPrioIndex = 0u;
 
             std::unique_lock<dxvk::mutex> lock(m_mutex);
+            const size_t dequeued = m_queueHighPrio.queue.size();
             std::swap(highPrio, m_queueHighPrio.queue);
+
+            if (traceFeed && dequeued)
+              helios_feed::csChunkDequeued(dequeued, 0u);
 
             m_hasHighPrio.store(false);
           }
@@ -286,7 +307,16 @@ namespace dxvk {
 
           m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
 
+          const auto workStart = traceFeed
+            ? dxvk::high_resolution_clock::now()
+            : dxvk::high_resolution_clock::time_point();
           entry.chunk->executeAll(m_context.ptr());
+
+          if (traceFeed) {
+            const auto workEnd = dxvk::high_resolution_clock::now();
+            helios_feed::csWorkerWork(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(workEnd - workStart).count());
+          }
 
           if (entry.seq) {
             // Use a separate mutex for the chunk counter, this will only

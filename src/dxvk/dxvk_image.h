@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dxvk_buffer.h"
 #include "dxvk_descriptor_pool.h"
 #include "dxvk_fence.h"
 #include "dxvk_format.h"
@@ -8,8 +9,6 @@
 #include "dxvk_util.h"
 
 namespace dxvk {
-
-  class DxvkBuffer;
 
   /**
    * \brief Image create info

@@ -9394,6 +9394,15 @@ namespace dxvk {
     // m_sharedImagesTouched. The armed waits land on THIS list's first
     // vkQueueSubmit2.
     heliosEmitScanoutReuseWaits();
+    // Pre-arms are one-list reservations. Retain their resid entries and move
+    // the generation instead of clearing/reallocating every frame; only the
+    // mathematically impossible wrap needs an invalidating clear.
+    m_heliosScanoutPrearmGeneration += 1u;
+    if (m_heliosScanoutPrearmGeneration == 0u) {
+      m_heliosScanoutPrearmed.clear();
+      m_heliosScanoutPrearmedUnclaimed.clear();
+      m_heliosScanoutPrearmGeneration = 1u;
+    }
 
     releaseSharedImagesToExternal();
 
@@ -9613,9 +9622,11 @@ namespace dxvk {
 
     uint32_t pid = 0u;
     uint32_t fenceId = 0u;
+    uint64_t producerStart = 0u;
     uint64_t value = 0u;
 
-    if (!resid || !HeliosPresentSync::lookup(resid, &pid, &fenceId, &value)) {
+    if (!resid || !HeliosPresentSync::lookup(
+          resid, &pid, &fenceId, &producerStart, &value)) {
       // No publish slot = an UNORDERED read of an imported surface. Counted
       // loudly: this silent return is exactly what hid the drag-trail root
       // cause (2026-07-06).
@@ -9627,7 +9638,7 @@ namespace dxvk {
       return;
     }
 
-    DxvkFence* fence = heliosProducerFence(pid, fenceId);
+    DxvkFence* fence = heliosProducerFence(pid, producerStart, fenceId);
     if (fence == nullptr)
       return;
 
@@ -9722,9 +9733,11 @@ namespace dxvk {
     for (uint32_t resid : m_heliosImportedReads) {
       uint32_t pid = 0u;
       uint32_t fenceId = 0u;
+      uint64_t producerStart = 0u;
       uint64_t value = 0u;
 
-      if (!HeliosPresentSync::lookup(resid, &pid, &fenceId, &value)) {
+      if (!HeliosPresentSync::lookup(
+            resid, &pid, &fenceId, &producerStart, &value)) {
         // No slot = this producer publishes nothing, so its surface is read
         // UNORDERED. Loud rather than silent: a steady nonzero count here is
         // the black-frame defect, named.
@@ -9738,7 +9751,7 @@ namespace dxvk {
         continue;
       }
 
-      DxvkFence* fence = heliosProducerFence(pid, fenceId);
+      DxvkFence* fence = heliosProducerFence(pid, producerStart, fenceId);
 
       if (fence == nullptr)
         continue;
@@ -9746,7 +9759,7 @@ namespace dxvk {
       // Skip a value this submission chain has already waited past. Correct
       // because timeline values only advance: an earlier submission waiting for
       // >= value is ordered ahead of this one on the same queue.
-      const uint64_t key = (uint64_t(pid) << 32) | fenceId;
+      const HeliosPresentFenceKey key = { pid, fenceId, producerStart };
       uint64_t& waited = m_heliosImportedWaited[key];
 
       if (waited >= value)
@@ -9765,11 +9778,14 @@ namespace dxvk {
   }
 
 
-  DxvkFence* DxvkContext::heliosProducerFence(uint32_t pid, uint32_t fenceId) {
-    // Keyed by (pid, fenceId): one producer process owns several D3D11
-    // devices, each with its own named fence; a recreated device in the
-    // same pid gets a fresh fence id, which naturally invalidates the cache.
-    const uint64_t fenceKey = (uint64_t(pid) << 32) | fenceId;
+  DxvkFence* DxvkContext::heliosProducerFence(
+          uint32_t pid,
+          uint64_t producerStart,
+          uint32_t fenceId) {
+    // The process creation time is part of both the cache key and kernel name.
+    // HPS2 persists across boots, so pid and this per-DLL fence counter alone
+    // are an ABA-prone identity (observed as DWM waiting 129 -> stale 1416).
+    const HeliosPresentFenceKey fenceKey = { pid, fenceId, producerStart };
     auto& entry = m_heliosPresentWaitFences[fenceKey];
 
     if (entry.fence == nullptr) {
@@ -9782,6 +9798,7 @@ namespace dxvk {
       // slot) makes the name unresolvable: negative-cache with periodic
       // retry so a respawned producer with a recycled pid still connects.
       const std::wstring name = L"Global\\HeliosPresentFence_" + std::to_wstring(pid)
+                              + L"_" + std::to_wstring(producerStart)
                               + L"_" + std::to_wstring(fenceId);
 
       try {
@@ -9791,14 +9808,15 @@ namespace dxvk {
         fenceInfo.ntImportName = name.c_str();
         entry.fence = m_device->createFence(fenceInfo);
         Logger::info(str::format("Helios present-wait: imported fence ", fenceId,
-          " of producer pid ", pid));
+          " of producer pid ", pid, " start ", producerStart));
       } catch (const DxvkError& e) {
         entry.retryCountdown = 256u;
         static uint32_t s_importFails = 0u;
         const uint32_t n = ++s_importFails;
         if (n == 1u || (n % 64u) == 0u) {
           Logger::warn(str::format("Helios present-wait: import of producer pid ",
-            pid, " fence FAILED (x", n, "): ", e.message()));
+            pid, " start ", producerStart, " fence FAILED (x", n,
+            "): ", e.message()));
         }
         return nullptr;
       }
@@ -9871,14 +9889,30 @@ namespace dxvk {
         continue;
       }
 
-      uint32_t issued = 0u;
-      uint32_t retired = 0u;
+      uint64_t generation = 0u;
+      uint64_t issued = 0u;
+      uint64_t retired = 0u;
 
-      if (!helios_acquire::ledgerLookup(resid, &issued, &retired)) {
+      if (!helios_acquire::ledgerLookupV2(resid, &generation, &issued, &retired)) {
         // No slot: the KMD never issued a readback of this buffer (or the
-        // 8-slot table overflowed, counted KMD-side as RdOvf), so there is
+        // v2 table overflowed, counted KMD-side as RdOvf), so there is
         // nothing to order against — today's behavior, loudly.
         m_heliosScanoutLedgerMiss += 1u;
+        continue;
+      }
+
+      // The snapshot-copy closure captured this claim before Present could
+      // issue its current WindowedBlt reservation. Resolve first so a
+      // same-resid re-claim is suppressed only when its exact generation was
+      // prearmed. A missing prior slot uses the one-list unresolved marker;
+      // only the Present that owns this closure can mint that next claim.
+      const auto prearmed = m_heliosScanoutPrearmed.find(generation);
+      const auto unclaimed = m_heliosScanoutPrearmedUnclaimed.find(resid);
+      if ((prearmed != m_heliosScanoutPrearmed.end()
+            && prearmed->second == m_heliosScanoutPrearmGeneration)
+       || (unclaimed != m_heliosScanoutPrearmedUnclaimed.end()
+            && unclaimed->second == m_heliosScanoutPrearmGeneration)) {
+        m_heliosScanoutSkipped += 1u;
         continue;
       }
 
@@ -9893,15 +9927,15 @@ namespace dxvk {
       // Skip a value this submission chain already waited past — an earlier
       // list on the same queue waiting >= issued orders this one too
       // (m_heliosImportedWaited's argument, per-resid).
-      uint64_t& waited = m_heliosScanoutWaited[resid];
+      uint64_t& waited = m_heliosScanoutWaited[generation];
 
-      if (waited >= uint64_t(issued)) {
+      if (waited >= issued) {
         m_heliosScanoutSkipped += 1u;
         continue;
       }
 
       Rc<DxvkFence> fence = m_device->heliosScanoutAcquire()
-        .armFence(resid, issued, retired);
+        .armFence(resid, generation, issued, retired);
 
       if (fence == nullptr) {
         // Shutdown or fence-creation failure (counted device-side): run
@@ -9910,7 +9944,7 @@ namespace dxvk {
         continue;
       }
 
-      waited = uint64_t(issued);
+      waited = issued;
 
       // The conditional GPU-side wait. waitFence's getValue() elision reads
       // the venus feedback slot (cheap, guest-side); an unelided wait rides
@@ -9918,9 +9952,53 @@ namespace dxvk {
       // buffers (the touched set implies recorded work), so the venus
       // wait-only submission fold can never see it (landmine #2), and no
       // sync-only batch is ever emitted here.
-      m_cmd->waitFence(std::move(fence), uint64_t(issued));
+      m_cmd->waitFence(std::move(fence), issued);
       m_heliosScanoutArmed += 1u;
     }
+  }
+
+
+  void DxvkContext::heliosPrearmScanoutReuseWait(
+          uint32_t            resid,
+          uint64_t            generation,
+          uint64_t            issued,
+          uint64_t            retired,
+    const Rc<DxvkFence>&       fence) {
+    if (!resid)
+      return;
+
+    // Mark even for {0,0}: the marker, not a fence wait, prevents the generic
+    // pass from observing this Present's newly issued reader. A resolved claim
+    // is keyed by generation; only the pre-Present no-slot case needs a
+    // one-list resid marker because no ticket exists yet to name that exact
+    // reservation.
+    if (generation)
+      m_heliosScanoutPrearmed[generation] = m_heliosScanoutPrearmGeneration;
+    else
+      m_heliosScanoutPrearmedUnclaimed[resid] = m_heliosScanoutPrearmGeneration;
+
+    if (!generation || issued <= retired) {
+      m_heliosScanoutSkipped += 1u;
+      return;
+    }
+
+    uint64_t& waited = m_heliosScanoutWaited[generation];
+    if (waited >= issued) {
+      m_heliosScanoutSkipped += 1u;
+      return;
+    }
+
+    if (fence == nullptr) {
+      // Construction was attempted synchronously by the immediate context
+      // before it allowed the snapshot plan to reach Present. This is only a
+      // defensive closure invariant; never skip a live reader here.
+      m_heliosScanoutSkipped += 1u;
+      return;
+    }
+
+    waited = issued;
+    m_cmd->waitFence(fence, issued);
+    m_heliosScanoutArmed += 1u;
   }
 
 
@@ -10000,14 +10078,16 @@ namespace dxvk {
       if (m_device->config().heliosSkipUnretiredRefresh) {
         const uint32_t resid = image->info().sharing.heliosResourceId;
         uint32_t slotPid = 0u, slotFenceId = 0u;
-        uint64_t slotValue = 0u;
+        uint64_t slotProducerStart = 0u, slotValue = 0u;
         bool kwaitOrdered = false;
 
         if (resid
-         && HeliosPresentSync::lookup(resid, &slotPid, &slotFenceId, &slotValue, &kwaitOrdered)
+         && HeliosPresentSync::lookup(resid, &slotPid, &slotFenceId,
+              &slotProducerStart, &slotValue, &kwaitOrdered)
          && kwaitOrdered
          && slotValue > image->heliosLastRefreshValue()) {
-          DxvkFence* fence = heliosProducerFence(slotPid, slotFenceId);
+          DxvkFence* fence = heliosProducerFence(
+            slotPid, slotProducerStart, slotFenceId);
 
           if (fence != nullptr && fence->getValue() < slotValue) {
             image->heliosReleaseFlushClaim(slotValue);
@@ -10060,7 +10140,8 @@ namespace dxvk {
       if (const uint32_t resid = image->info().sharing.heliosResourceId) {
         uint32_t slotPid = 0u, slotFenceId = 0u;
         uint64_t slotValue = 0u;
-        if (HeliosPresentSync::lookup(resid, &slotPid, &slotFenceId, &slotValue))
+        if (HeliosPresentSync::lookup(
+              resid, &slotPid, &slotFenceId, nullptr, &slotValue))
           image->setHeliosLastRefreshValue(slotValue);
       }
 

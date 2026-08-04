@@ -1,4 +1,5 @@
 #include "dxvk_device.h"
+#include "dxvk_helios_feed_trace.h"
 #include "dxvk_instance.h"
 #include "dxvk_latency_builtin.h"
 #include "dxvk_latency_reflex.h"
@@ -36,6 +37,11 @@ namespace dxvk {
     m_checkpoints       (this),
     m_submissionQueue   (this, queueCallback),
     m_heliosScanoutAcquire(this) {
+
+    // Construct the fixed trace storage before any producer can enqueue work
+    // when the targeted feed trace is enabled. This keeps the hot sites to
+    // relaxed atomic updates and timestamp reads only.
+    helios_feed::initialize();
 
     if (adapter->kmtLocal()) {
       D3DKMT_CREATEDEVICE create = { };
@@ -82,6 +88,11 @@ namespace dxvk {
     // Stop workers explicitly in order to prevent
     // access to structures that are being destroyed.
     m_objects.pipelineManager().stopWorkerThreads();
+
+    // Re-dumps deliberately overwrite the PID-specific file: a process may
+    // create probe devices before its workload device. Module detachment
+    // returned above and never attempts file I/O.
+    helios_feed::dump();
   }
 
 

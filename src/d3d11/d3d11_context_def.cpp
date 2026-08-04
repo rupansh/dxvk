@@ -1,6 +1,8 @@
 #include "d3d11_context_def.h"
 #include "d3d11_device.h"
 
+#include "../dxvk/dxvk_helios_feed_trace.h"
+
 namespace dxvk {
 
   constexpr size_t MaxHeliosRecycledCommandLists = 64u;
@@ -223,6 +225,7 @@ namespace dxvk {
           BOOL                RestoreDeferredContextState,
           ID3D11CommandList   **ppCommandList) {
     D3D10DeviceLock lock = LockContext();
+    helios_feed::deferredFinish();
 
     // End all queries that were left active by the app
     FinalizeQueries();
@@ -296,6 +299,11 @@ namespace dxvk {
 
     if (unlikely(!pResource || !pMappedResource))
       return E_INVALIDARG;
+
+    if (MapType == D3D11_MAP_WRITE_DISCARD)
+      helios_feed::mapWriteDiscard();
+    if (MapFlags & D3D11_MAP_FLAG_DO_NOT_WAIT)
+      helios_feed::mapDoNotWait();
     
     if (likely(MapType == D3D11_MAP_WRITE_DISCARD)) {
       D3D11_RESOURCE_DIMENSION resourceDim;

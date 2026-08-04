@@ -210,6 +210,17 @@ namespace dxvk {
     }
 
     /**
+     * \brief Exact number of bytes occupied by recorded commands
+     *
+     * Includes alignment and command-data payloads in the fixed-size chunk.
+     * This is the byte-accurate counterpart to the chunk's coarse 16 KiB
+     * capacity and is stable while a deferred command list owns the chunk.
+     */
+    size_t usedBytes() const {
+      return m_commandOffset;
+    }
+
+    /**
      * \brief Tries to add a command to the chunk
      * 
      * If the given command can be added to the chunk, it

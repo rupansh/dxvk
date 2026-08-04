@@ -4,6 +4,8 @@
 #include "d3d11_fence.h"
 #include "d3d11_texture.h"
 
+#include "../dxvk/dxvk_helios_feed_trace.h"
+#include "../dxvk/dxvk_helios_scanout_acquire.h"
 #include "../util/util_win32_compat.h"
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
@@ -18,7 +20,8 @@ namespace dxvk {
   : D3D11CommonContext<D3D11ImmediateContext>(pParent, Device, 0, DxvkCsChunkFlag::SingleUse),
     m_csThread(Device, Device->createContext()),
     m_submissionFence(new sync::CallbackFence()),
-    m_flushTracker(GetMaxFlushType(pParent, Device)),
+    m_flushTracker(GetMaxFlushType(pParent, Device),
+      heliosFlushTrackerMax64() ? 64u : 20u),
     m_stagingBufferFence(new sync::Fence(0)),
     m_multithread(this, false, pParent->GetOptions()->enableContextLock),
     m_videoContext(this, Device),
@@ -91,6 +94,7 @@ namespace dxvk {
     // Get query status directly from the query object
     auto query = static_cast<D3D11Query*>(pAsync);
     HRESULT hr = query->GetData(pData, GetDataFlags);
+    helios_feed::getData(hr == S_OK);
     
     // If we're likely going to spin on the asynchronous object,
     // flush the context so that we're keeping the GPU busy.
@@ -230,6 +234,7 @@ namespace dxvk {
     D3D10DeviceLock lock = LockContext();
 
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
+    helios_feed::immediateExecute();
 
     if (unlikely(heliosClStats())) {
       m_parent->NoteHeliosCommandListExecuted(
@@ -253,11 +258,31 @@ namespace dxvk {
     // Helios: an empty fast-path list carries no CS-visible work; only the
     // API-level context reset below still applies.
     if (likely(!commandList->IsEmpty())) {
-      if (heliosClFastPath()
-       && heliosClInlineReplay()
-       && commandList->CanReplayInline()) {
+      const bool fastPathEnabled = heliosClFastPath();
+      const bool inlineReplayEnabled = fastPathEnabled && heliosClInlineReplay();
+      const bool inlineReplayAdmitted = inlineReplayEnabled
+        && commandList->CanReplayInline();
+
+      if (helios_feed::enabled()) {
+        if (inlineReplayAdmitted)
+          helios_feed::inlineReplayAdmitted();
+        else if (!fastPathEnabled)
+          helios_feed::inlineReplayFallbackFastPathDisabled();
+        else if (!inlineReplayEnabled)
+          helios_feed::inlineReplayFallbackDisabled();
+        else
+          helios_feed::inlineReplayFallbackIneligible();
+      }
+
+      if (inlineReplayAdmitted) {
         if (unlikely(heliosClStats()))
           m_parent->NoteHeliosInlineReplayAdmission();
+
+        const uint64_t replayBytes = commandList->GetReplayByteSize();
+        const bool replayByteAccounting = heliosClReplayByteAccounting();
+
+        if (helios_feed::enabled())
+          helios_feed::inlineReplayBytes(replayBytes);
 
         // One wrapper owns one deferred chunk and runs it on the immediate
         // chunk's CS-thread turn. Capture the physical sequence range before
@@ -274,12 +299,36 @@ namespace dxvk {
         if (physicalChunks < 1u)
           m_heliosFlushChunkOffset += 1u - physicalChunks;
 
-        // Do not let a tiny wrapper hide an unbounded amount of deferred
-        // work from high-priority CS injection. The gate only admits
-        // one-chunk lists, so this also caps underlying replay chunks.
-        if (++m_heliosInlineReplayChunkCount >= MaxHeliosInlineReplayChunks) {
+        bool flushInlineReplay = false;
+        bool byteCapFlush = false;
+        bool hardCountCapFlush = false;
+
+        if (replayByteAccounting) {
+          m_heliosInlineReplayBytes += replayBytes;
+          ++m_heliosInlineReplayChunkCount;
+
+          byteCapFlush = m_heliosInlineReplayBytes
+            >= MaxHeliosInlineReplayByteAccountingBytes;
+          hardCountCapFlush = !byteCapFlush
+            && m_heliosInlineReplayChunkCount
+            >= MaxHeliosInlineReplayByteAccountingChunks;
+          flushInlineReplay = byteCapFlush || hardCountCapFlush;
+        } else {
+          // Preserve the default fixed 16-wrapper scheduling policy exactly.
+          flushInlineReplay = ++m_heliosInlineReplayChunkCount
+            >= MaxHeliosInlineReplayChunks;
+        }
+
+        if (flushInlineReplay) {
           if (unlikely(heliosClStats()))
             m_parent->NoteHeliosInlineReplayCapFlush();
+          if (helios_feed::enabled()) {
+            helios_feed::inlineReplayCapFlush();
+            if (byteCapFlush)
+              helios_feed::inlineReplayByteCapFlush();
+            else if (hardCountCapFlush)
+              helios_feed::inlineReplayHardCountCapFlush();
+          }
           FlushCsChunk();
         }
 
@@ -365,6 +414,11 @@ namespace dxvk {
 
     if (unlikely(!pResource))
       return E_INVALIDARG;
+
+    if (MapType == D3D11_MAP_WRITE_DISCARD)
+      helios_feed::mapWriteDiscard();
+    if (MapFlags & D3D11_MAP_FLAG_DO_NOT_WAIT)
+      helios_feed::mapDoNotWait();
     
     D3D11_RESOURCE_DIMENSION resourceDim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
     pResource->GetType(&resourceDim);
@@ -995,14 +1049,24 @@ namespace dxvk {
       // still try to spin on `Map` until the resource is
       // idle, so we should flush pending commands
       ConsiderFlush(GpuFlushType::ImplicitSynchronization);
+      helios_feed::mapDoNotWaitRefusal();
       return false;
     } else {
       // Make sure pending commands using the resource get
       // executed on the the GPU if we have to wait for it
-      ExecuteFlush(GpuFlushType::ImplicitSynchronization, nullptr, false);
-      SynchronizeCsThread(SequenceNumber);
-
-      m_device->waitForResource(Resource, access);
+      if (helios_feed::enabled()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ExecuteFlush(GpuFlushType::ImplicitSynchronization, nullptr, false);
+        SynchronizeCsThread(SequenceNumber);
+        m_device->waitForResource(Resource, access);
+        const auto t1 = std::chrono::steady_clock::now();
+        helios_feed::mapGpuWait(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+      } else {
+        ExecuteFlush(GpuFlushType::ImplicitSynchronization, nullptr, false);
+        SynchronizeCsThread(SequenceNumber);
+        m_device->waitForResource(Resource, access);
+      }
       return true;
     }
   }
@@ -1066,8 +1130,20 @@ namespace dxvk {
     // Back-pressure still exists -- DxvkSubmissionQueue::submit blocks once
     // MaxNumQueuedCommandBuffers are in flight -- and that is the frames-in-
     // flight limiter every DXVK app already runs with.
-    SynchronizeCsThread(sequenceNumber);
-    m_device->syncSubmissions();
+    if (helios_feed::enabled()) {
+      const auto csBegin = std::chrono::steady_clock::now();
+      SynchronizeCsThread(sequenceNumber);
+      const auto csEnd = std::chrono::steady_clock::now();
+      m_device->syncSubmissions();
+      const auto submissionsEnd = std::chrono::steady_clock::now();
+
+      helios_feed::waitFrameSubmitted(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(csEnd - csBegin).count(),
+        std::chrono::duration_cast<std::chrono::nanoseconds>(submissionsEnd - csEnd).count());
+    } else {
+      SynchronizeCsThread(sequenceNumber);
+      m_device->syncSubmissions();
+    }
   }
 
 
@@ -1106,17 +1182,62 @@ namespace dxvk {
   }
 
 
-  void D3D11ImmediateContext::HeliosCopyPresentSnapshot(
+  bool D3D11ImmediateContext::HeliosCopyPresentSnapshot(
     const Rc<DxvkImage>&        DstImage,
     const Rc<DxvkImage>&        SrcImage,
-          VkExtent3D            Extent) {
+          VkExtent3D            Extent,
+          bool                  WindowedBltReservation) {
     D3D10DeviceLock lock = LockContext();
+
+    // Capture this snapshot-slot's reservation epoch before Present can issue
+    // the current KMD reader lease. The later CS closure uses these scalars;
+    // re-reading N+1 there would make the overwrite wait circular.
+    uint32_t reservationResid = 0u;
+    uint64_t reservationGeneration = 0u;
+    uint64_t reservationIssued = 0u;
+    uint64_t reservationRetired = 0u;
+    Rc<DxvkFence> reservationFence = nullptr;
+    if (WindowedBltReservation) {
+      // WindowedBlt's KMD reader is reserved at Present, unlike D4b's later
+      // host flush. It must either have this pre-arm or fail the snapshot; a
+      // best-effort omission recreates the producer/reader circular wait.
+      if (!helios_acquire::enabled())
+        return false;
+      Rc<DxvkResourceAllocation> storage = DstImage->storage();
+      if (storage == nullptr)
+        return false;
+      reservationResid = helios_acquire::residFromMemory(
+        storage->getMemoryInfo().memory);
+      if (!reservationResid)
+        return false;
+      // Missing is the initial exact {0,0} reservation. Preserve the mark
+      // because KMD may create the slot before this ordered closure runs.
+      helios_acquire::ledgerLookupV2(
+        reservationResid, &reservationGeneration,
+        &reservationIssued, &reservationRetired);
+      if (reservationIssued > reservationRetired) {
+        reservationFence = m_device->heliosScanoutAcquire().armFence(
+          reservationResid, reservationGeneration, reservationIssued, reservationRetired);
+        if (reservationFence == nullptr)
+          return false;
+      }
+    }
 
     EmitCs([
       cDstImage = DstImage,
       cSrcImage = SrcImage,
-      cExtent   = Extent
+      cExtent   = Extent,
+      cReservationResid = reservationResid,
+      cReservationGeneration = reservationGeneration,
+      cReservationIssued = reservationIssued,
+      cReservationRetired = reservationRetired,
+      cReservationFence = reservationFence
     ] (DxvkContext* ctx) {
+      if (cReservationResid)
+        ctx->heliosPrearmScanoutReuseWait(
+          cReservationResid, cReservationGeneration,
+          cReservationIssued, cReservationRetired,
+          cReservationFence);
       const VkImageSubresourceLayers layers =
         { VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u };
       ctx->copyImage(
@@ -1124,6 +1245,7 @@ namespace dxvk {
         cSrcImage, layers, VkOffset3D { 0, 0, 0 },
         cExtent);
     });
+    return true;
   }
 
 
@@ -1144,6 +1266,7 @@ namespace dxvk {
 
     m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
     m_heliosInlineReplayChunkCount = 0u;
+    m_heliosInlineReplayBytes = 0ull;
   }
 
 
@@ -1287,8 +1410,18 @@ namespace dxvk {
     uint64_t chunkId = GetFlushTrackerChunkId();
     uint64_t submissionId = m_submissionFence->value();
 
-    if (m_flushTracker.considerFlush(FlushType, chunkId, submissionId, m_estimatedCost))
+    if (helios_feed::enabled()) {
+      GpuFlushTrackerDiagnostic diagnostic;
+      const bool accepted = m_flushTracker.considerFlush(
+        FlushType, chunkId, submissionId, m_estimatedCost, &diagnostic);
+      helios_feed::flushTrackerDecision(diagnostic);
+
+      if (accepted)
+        ExecuteFlush(FlushType, nullptr, false);
+    } else if (m_flushTracker.considerFlush(
+        FlushType, chunkId, submissionId, m_estimatedCost)) {
       ExecuteFlush(FlushType, nullptr, false);
+    }
   }
 
 
@@ -1302,7 +1435,12 @@ namespace dxvk {
       m_submitStatus.result = VK_NOT_READY;
 
     // Exit early if there's nothing to do
-    if (!GetPendingCsChunks() && !hEvent)
+    const bool nonEmpty = GetPendingCsChunks() || hEvent;
+
+    if (helios_feed::enabled())
+      helios_feed::executeFlush(FlushType, nonEmpty);
+
+    if (!nonEmpty)
       return;
 
     m_hasPendingUnresolvedPass = false;

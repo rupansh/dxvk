@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <chrono>
 
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
+#include "dxvk_helios_feed_trace.h"
 
 namespace dxvk {
 
@@ -88,8 +90,20 @@ namespace dxvk {
 
     VkResult vr = VK_SUCCESS;
 
-    if (!this->isEmpty())
-      vr = vk->vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    if (!this->isEmpty()) {
+      if (helios_feed::enabled()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        vr = vk->vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        const auto t1 = std::chrono::steady_clock::now();
+        helios_feed::vkQueueSubmit(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(),
+          submitInfo.commandBufferInfoCount,
+          submitInfo.waitSemaphoreInfoCount,
+          submitInfo.signalSemaphoreInfoCount);
+      } else {
+        vr = vk->vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+      }
+    }
 
     this->reset();
     return vr;

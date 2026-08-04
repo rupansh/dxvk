@@ -1549,7 +1549,11 @@ namespace dxvk {
     void setDebugName(const Rc<DxvkPagedResource>& resource, const char* name);
 
   private:
-    
+
+    // The D3D11 immediate context records the ordered snapshot copy and is the
+    // only layer allowed to pre-arm that command list's exact reader wait.
+    friend class D3D11ImmediateContext;
+
     Rc<DxvkDevice>          m_device;
     DxvkObjects*            m_common;
 
@@ -1759,14 +1763,37 @@ namespace dxvk {
     uint32_t                                  m_heliosStagedProbesIssued = 0u;
 
     /* Helios WS1 #4 consumer-side present wait (dxvk.heliosPresentWaitUs).
-     * Named present fences imported once per (producer pid << 32 | fence
-     * id); negative cache (null fence) for unresolvable names with periodic
-     * retry. */
+     * The exact producer generation is (pid, process creation time, fence id).
+     * HPS2 persists across boots, and pid plus the per-DLL fence counter both
+     * repeat; omitting creation time caused DWM to import its new fence for an
+     * old slot and wait forever on an unreachable value. */
+    struct HeliosPresentFenceKey {
+      uint32_t pid = 0u;
+      uint32_t fenceId = 0u;
+      uint64_t producerStart = 0u;
+
+      bool operator == (const HeliosPresentFenceKey& other) const {
+        return pid == other.pid
+            && fenceId == other.fenceId
+            && producerStart == other.producerStart;
+      }
+    };
+
+    struct HeliosPresentFenceKeyHash {
+      size_t operator () (const HeliosPresentFenceKey& key) const {
+        const uint64_t pidFence = (uint64_t(key.pid) << 32) | key.fenceId;
+        const size_t h1 = std::hash<uint64_t>()(key.producerStart);
+        const size_t h2 = std::hash<uint64_t>()(pidFence);
+        return h1 ^ (h2 + size_t(0x9e3779b9u) + (h1 << 6) + (h1 >> 2));
+      }
+    };
+
     struct HeliosPresentWaitFence {
       Rc<DxvkFence> fence;
       uint32_t      retryCountdown = 0u;
     };
-    std::unordered_map<uint64_t, HeliosPresentWaitFence> m_heliosPresentWaitFences;
+    std::unordered_map<HeliosPresentFenceKey, HeliosPresentWaitFence,
+      HeliosPresentFenceKeyHash> m_heliosPresentWaitFences;
 
     /* Helios cross-process present ordering, CONSUMER side. Venus resource ids
      * of imported surfaces this command list samples, deduplicated; drained at
@@ -1778,11 +1805,12 @@ namespace dxvk {
      * before publishing the present -- cost Fire Strike GT1 158 -> 136 fps and
      * Combined 25.9 -> 18.8 fps, because it removed all CPU/GPU overlap. */
     std::vector<uint32_t>                     m_heliosImportedReads;
-    /* Last value already waited for per (pid << 32 | fenceId). A timeline wait
-     * on an already-reached value is nearly free, but skipping it keeps the
-     * submission's wait list short when dwm composes many windows fed by one
-     * producer. */
-    std::unordered_map<uint64_t, uint64_t>    m_heliosImportedWaited;
+    /* Last value already waited for per exact producer generation. A timeline
+     * wait on an already-reached value is nearly free, but skipping it keeps
+     * the submission's wait list short when dwm composes many windows fed by
+     * one producer. */
+    std::unordered_map<HeliosPresentFenceKey, uint64_t,
+      HeliosPresentFenceKeyHash> m_heliosImportedWaited;
     uint64_t                                  m_heliosImportedWaitsEmitted = 0u;
 
     /* Helios D4a scanout-read acquire, consumer side: last ledger `issued`
@@ -1792,7 +1820,15 @@ namespace dxvk {
      * the wait list. Plus the census counters §7.1's predictions score
      * (armed/(armed+skipped) is the conditional-wait rate; residMiss and
      * ledgerMiss split "armed ~= 0" into identity-path vs no-slot causes). */
-    std::unordered_map<uint32_t, uint64_t>    m_heliosScanoutWaited;
+    // Generation is globally unique across KMD transport resets, so a recycled
+    // slot or same-resid re-claim cannot inherit a prior GPU-side wait.
+    std::unordered_map<uint64_t, uint64_t>    m_heliosScanoutWaited;
+    // A resolved reservation is keyed by the exact ledger generation. A missing
+    // pre-Present slot has no generation yet; its one-list resid marker only
+    // suppresses the exact current WindowedBlt reservation that will mint it.
+    std::unordered_map<uint64_t, uint64_t>    m_heliosScanoutPrearmed;
+    std::unordered_map<uint32_t, uint64_t>    m_heliosScanoutPrearmedUnclaimed;
+    uint64_t                                  m_heliosScanoutPrearmGeneration = 1u;
     uint64_t                                  m_heliosScanoutFlushes    = 0u;
     uint64_t                                  m_heliosScanoutArmed      = 0u;
     uint64_t                                  m_heliosScanoutSkipped    = 0u;
@@ -2410,8 +2446,16 @@ namespace dxvk {
 
     void heliosEmitScanoutReuseWaits();
 
+    void heliosPrearmScanoutReuseWait(
+            uint32_t            resid,
+            uint64_t            generation,
+            uint64_t            issued,
+            uint64_t            retired,
+      const Rc<DxvkFence>&       fence);
+
     DxvkFence* heliosProducerFence(
             uint32_t            pid,
+            uint64_t            producerStart,
             uint32_t            fenceId);
 
     void releaseSharedImagesToExternal();

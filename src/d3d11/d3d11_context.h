@@ -104,6 +104,54 @@ namespace dxvk {
   }
 
   /**
+   * \brief Helios inline-replay byte-accounting experiment
+   *
+   * Default OFF. `HELIOS_DXVK_CL_REPLAY_BYTE_ACCOUNTING=1` replaces the
+   * inline replay wrapper-count batching policy with an exact occupied-byte
+   * budget. It remains subordinate to inline replay and retains a separate
+   * finite wrapper ceiling for pathologically tiny command lists.
+   */
+  inline bool heliosClReplayByteAccounting() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_CL_REPLAY_BYTE_ACCOUNTING");
+      return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return heliosClInlineReplay() && enabled;
+  }
+
+  /**
+   * \brief Helios D3D11 weak-flush ceiling experiment
+   *
+   * Default OFF. `HELIOS_DXVK_FLUSH_TRACKER_MAX64=1` raises only this
+   * D3D11 context's weak/synchronizing pending-submission ceiling from 20 to
+   * 64 logical chunks. The process-latched knob is intentionally independent
+   * of command-list transport policy.
+   */
+  inline bool heliosFlushTrackerMax64() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_FLUSH_TRACKER_MAX64");
+      return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+  }
+
+  /**
+   * \brief Helios D3D11 local-allocation-cache fallback experiment
+   *
+   * Default OFF. `HELIOS_DXVK_LOCAL_ALLOC_CACHE_FALLBACK=1` retries only an
+   * unusable D3D11 local cache without DEVICE_LOCAL in its cache request.
+   * The cache is selected once per process; buffer allocation properties and
+   * the allocator's normal per-allocation fallback remain unchanged.
+   */
+  inline bool heliosLocalAllocCacheFallback() {
+    static const bool enabled = [] {
+      const char* env = std::getenv("HELIOS_DXVK_LOCAL_ALLOC_CACHE_FALLBACK");
+      return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+  }
+
+  /**
    * \brief Helios command-list bulk cleanup experiment
    *
    * Default ON. `HELIOS_DXVK_CL_BULK_RESET=0` restores the scalar cleanup

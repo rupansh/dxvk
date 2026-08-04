@@ -281,12 +281,10 @@ namespace dxvk {
     // rotation without resolving the Venus memory export for every unrelated
     // allocation destruction. Release before KMT/Vulkan teardown so a later
     // same-process id reuse cannot be erased by this old allocation.
-    const uint64_t heliosPresentSlot = takeHeliosPresentSlot();
-    const uint32_t heliosPresentResid = uint32_t(heliosPresentSlot);
-    const uint32_t heliosPresentFence = uint32_t(heliosPresentSlot >> 32);
+    const HeliosPresentSlot heliosPresentSlot = takeHeliosPresentSlot();
 
-    if (heliosPresentResid && heliosPresentFence)
-      HeliosPresentSync::release(heliosPresentResid, heliosPresentFence);
+    if (heliosPresentSlot.resid && heliosPresentSlot.fenceId)
+      HeliosPresentSync::release(heliosPresentSlot.resid, heliosPresentSlot.fenceId);
 
     if (unlikely(m_kmtLocal && m_ownsKmtHandles)) {
       D3DKMT_DESTROYALLOCATION destroy = { };

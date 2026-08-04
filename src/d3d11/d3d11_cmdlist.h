@@ -73,6 +73,16 @@ namespace dxvk {
       return m_chunks[0].cost;
     }
 
+    /**
+     * \brief Exact recorded byte size of an inline-replayable list
+     *
+     * Callers must have checked \ref CanReplayInline. The returned size is
+     * the deferred chunk's actual occupied bytes, not its 16 KiB capacity.
+     */
+    uint64_t GetReplayByteSize() const {
+      return uint64_t(m_chunks[0].chunk->usedBytes());
+    }
+
     GpuFlushType GetReplayFlushType() const {
       return m_resources.empty()
         ? GpuFlushType::ImplicitWeakHint

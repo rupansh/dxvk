@@ -68,6 +68,9 @@ namespace dxvk {
     Logger::info(str::format("Helios CL knobs: fast=", heliosClFastPath() ? 1 : 0,
       " retain-sampler-refs=", heliosClRetainSamplerRefs() ? 1 : 0,
       " inline=", heliosClInlineReplay() ? 1 : 0,
+      " inline-byte-accounting=", heliosClReplayByteAccounting() ? 1 : 0,
+      " flush-tracker-max64=", heliosFlushTrackerMax64() ? 1 : 0,
+      " local-alloc-cache-fallback=", heliosLocalAllocCacheFallback() ? 1 : 0,
       " bulk-reset=", heliosClBulkStateReset() ? 1 : 0,
       " stats=", heliosClStats() ? 1 : 0));
   }

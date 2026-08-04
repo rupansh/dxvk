@@ -1,4 +1,5 @@
 #include "dxvk_device.h"
+#include "dxvk_helios_feed_trace.h"
 #include "dxvk_queue.h"
 
 namespace dxvk {
@@ -60,6 +61,7 @@ namespace dxvk {
     entry.latency = std::move(latencyInfo);
 
     m_submitQueue.push(std::move(entry));
+    helios_feed::submissionEnqueued(m_submitQueue.size());
     m_appendCond.notify_all();
   }
 
@@ -76,6 +78,7 @@ namespace dxvk {
     entry.latency = std::move(latencyInfo);
 
     m_submitQueue.push(std::move(entry));
+    helios_feed::submissionEnqueued(m_submitQueue.size());
     m_appendCond.notify_all();
   }
 
@@ -236,6 +239,7 @@ namespace dxvk {
         }
 
         m_submitQueue.pop();
+        helios_feed::submissionDequeued(m_submitQueue.size());
         m_submitCond.notify_all();
 
         if (droppedDeviceLost && droppedCmdList != nullptr) {

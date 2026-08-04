@@ -55,6 +55,42 @@ namespace dxvk {
 
 
   /**
+   * \brief Branch that produced a GPU flush tracker decision
+   *
+   * Pair this with \ref GpuFlushTrackerDiagnostic::accepted. The same
+   * threshold branch can accept or reject, while the early-exit branches are
+   * intrinsically one-sided.
+   */
+  enum class GpuFlushTrackerBranch : uint8_t {
+    NoChunks,
+    MaxTypeCost,
+    Explicit,
+    StrongChunkCount,
+    WeakMinimumChunkCount,
+    PendingSubmissionFloor,
+    PendingSubmissionChunkCount,
+    None,
+  };
+
+
+  /**
+   * \brief Optional observation of one GPU flush tracker decision
+   *
+   * This records the request exactly as received and its effective type after
+   * a previously missed stronger request has been folded in. It has no input
+   * role in the tracker and is populated only when explicitly requested.
+   */
+  struct GpuFlushTrackerDiagnostic {
+    GpuFlushType          requestedType;
+    GpuFlushType          effectiveType;
+    GpuFlushTrackerBranch branch;
+    bool                  accepted;
+    uint32_t              chunkCount;
+    uint32_t              pendingSubmissionCount;
+  };
+
+
+  /**
    * \brief GPU flush tracker
    *
    * Helper class that implements a context flush
@@ -64,7 +100,9 @@ namespace dxvk {
 
   public:
 
-    GpuFlushTracker(GpuFlushType maxAllowed);
+    GpuFlushTracker(
+            GpuFlushType          maxAllowed,
+            uint32_t              maxPendingSubmissionChunkCount = 20u);
 
     /**
      * \brief Queries type of last missed submission request
@@ -88,13 +126,15 @@ namespace dxvk {
      * \param [in] chunkId GPU command sequence number
      * \param [in] lastCompleteSubmissionId Last completed command submission ID
      * \param [in] estimatedCost Estimated submission cost
+     * \param [out] diagnostic Optional passive decision observation
      * \returns \c true if a flush should be performed
      */
     bool considerFlush(
             GpuFlushType          flushType,
             uint64_t              chunkId,
             uint32_t              lastCompleteSubmissionId,
-            uint64_t              estimatedCost);
+            uint64_t              estimatedCost,
+            GpuFlushTrackerDiagnostic* diagnostic = nullptr);
 
     /**
      * \brief Notifies tracker about a context flush
@@ -110,6 +150,8 @@ namespace dxvk {
 
     GpuFlushType  m_maxType               = GpuFlushType::ImplicitWeakHint;
     GpuFlushType  m_lastMissedType        = GpuFlushType::None;
+
+    uint32_t      m_maxPendingSubmissionChunkCount = 20u;
 
     uint64_t      m_lastFlushChunkId      = 0ull;
     uint64_t      m_lastFlushSubmissionId = 0ull;

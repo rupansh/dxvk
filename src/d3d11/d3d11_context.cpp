@@ -52,6 +52,11 @@ namespace dxvk {
 
     m_allocationCache = m_device->createAllocationCache(bufferUsage, memoryFlags);
 
+    if (heliosLocalAllocCacheFallback() && !m_allocationCache.isUsable()) {
+      m_allocationCache = m_device->createAllocationCache(bufferUsage,
+        memoryFlags & ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
+
     // Determine maximum tess factor based on device options
     if (!IsDeferred) {
       int32_t maxTessFactor = int32_t(std::min(m_device->properties().core.properties.limits.maxTessellationGenerationLevel, 64u));
@@ -3615,7 +3620,8 @@ namespace dxvk {
           uint32_t slotPid = 0u, slotFenceId = 0u;
           uint64_t slotValue = 0u;
 
-          if (HeliosPresentSync::lookup(resid, &slotPid, &slotFenceId, &slotValue)
+          if (HeliosPresentSync::lookup(
+                resid, &slotPid, &slotFenceId, nullptr, &slotValue)
            && slotValue > image->heliosLastRefreshValue()
            && image->heliosClaimFlushForValue(slotValue))
             flushNeeded = true;

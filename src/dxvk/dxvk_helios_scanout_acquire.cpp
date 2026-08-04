@@ -18,8 +18,8 @@ namespace dxvk {
 #ifdef _WIN32
 
     using PfnEnabled  = bool     (__cdecl*)();
-    using PfnLookup   = bool     (__cdecl*)(uint32_t, uint32_t*, uint32_t*);
-    using PfnSnapshot = uint32_t (__cdecl*)(uint32_t*, uint32_t);
+    using PfnLookup   = bool     (__cdecl*)(uint32_t, uint64_t*, uint64_t*, uint64_t*);
+    using PfnSnapshot = uint32_t (__cdecl*)(DxvkHeliosLedgerSlot*, uint32_t);
     using PfnResid    = uint32_t (__cdecl*)(VkDeviceMemory);
 
     /* The three helios_scanout_* exports live in the module CONTAINING this
@@ -46,8 +46,8 @@ namespace dxvk {
           return e;
 
         e.enabled  = reinterpret_cast<PfnEnabled> (GetProcAddress(mod, "helios_scanout_acquire_enabled"));
-        e.lookup   = reinterpret_cast<PfnLookup>  (GetProcAddress(mod, "helios_scanout_ledger_lookup"));
-        e.snapshot = reinterpret_cast<PfnSnapshot>(GetProcAddress(mod, "helios_scanout_ledger_snapshot"));
+        e.lookup   = reinterpret_cast<PfnLookup>  (GetProcAddress(mod, "helios_scanout_ledger_lookup_v2"));
+        e.snapshot = reinterpret_cast<PfnSnapshot>(GetProcAddress(mod, "helios_scanout_ledger_snapshot_v2"));
 
         if (!e.enabled || !e.lookup || !e.snapshot) {
           // All-or-nothing: a partial surface is a build skew, not a mode.
@@ -102,20 +102,18 @@ namespace dxvk {
       return e->enabled && e->enabled();
     }
 
-    bool ledgerLookup(uint32_t resid, uint32_t* issued, uint32_t* retired) {
+    bool ledgerLookupV2(uint32_t resid, uint64_t* generation, uint64_t* issued, uint64_t* retired) {
       const auto* e = umdExports();
-      return e->lookup && e->lookup(resid, issued, retired);
+      return e->lookup && e->lookup(resid, generation, issued, retired);
     }
 
-    uint32_t ledgerSnapshot(DxvkHeliosLedgerSlot* slots, uint32_t maxSlots) {
+    uint32_t ledgerSnapshotV2(DxvkHeliosLedgerSlot* slots, uint32_t maxSlots) {
       const auto* e = umdExports();
       if (!e->snapshot || !slots || !maxSlots)
         return 0u;
 
-      // The export writes (resid, issued, retired) u32 triples, which is
-      // exactly DxvkHeliosLedgerSlot's layout.
-      static_assert(sizeof(DxvkHeliosLedgerSlot) == 3u * sizeof(uint32_t));
-      return e->snapshot(reinterpret_cast<uint32_t*>(slots), maxSlots);
+      static_assert(sizeof(DxvkHeliosLedgerSlot) == 32u);
+      return e->snapshot(slots, maxSlots);
     }
 
     uint32_t residFromMemory(VkDeviceMemory memory) {
@@ -130,8 +128,8 @@ namespace dxvk {
 
     /* Non-Windows build of the engine: no Helios UMD, no KMD ledger. */
     bool enabled() { return false; }
-    bool ledgerLookup(uint32_t, uint32_t*, uint32_t*) { return false; }
-    uint32_t ledgerSnapshot(DxvkHeliosLedgerSlot*, uint32_t) { return 0u; }
+    bool ledgerLookupV2(uint32_t, uint64_t*, uint64_t*, uint64_t*) { return false; }
+    uint32_t ledgerSnapshotV2(DxvkHeliosLedgerSlot*, uint32_t) { return 0u; }
     uint32_t residFromMemory(VkDeviceMemory) { return 0u; }
 
 #endif
@@ -164,13 +162,22 @@ namespace dxvk {
   }
 
 
-  Rc<DxvkFence> DxvkHeliosScanoutAcquire::armFence(uint32_t resid, uint32_t issued, uint32_t retired) {
+  Rc<DxvkFence> DxvkHeliosScanoutAcquire::armFence(
+          uint32_t resid, uint64_t generation, uint64_t issued, uint64_t retired) {
     std::lock_guard<dxvk::mutex> lock(m_mutex);
 
-    if (m_stop)
+    if (m_stop || !resid || !generation)
       return nullptr;
 
-    auto& gate = m_gates[resid];
+    auto& gate = m_gates[generation];
+
+    if (gate.fence != nullptr && gate.resid != resid) {
+      // A generation is globally unique KMD-side. Do not let an ABI or memory
+      // corruption turn a generation gate into a different resource's gate.
+      Logger::err(str::format("helios-acquire: generation ", generation,
+        " changed resid from ", gate.resid, " to ", resid));
+      return nullptr;
+    }
 
     if (gate.fence == nullptr) {
       // Landmine #1 (spec §5.4): a PLAIN INTERNAL timeline. The default
@@ -188,13 +195,14 @@ namespace dxvk {
       try {
         gate.fence = m_device->createFence(fenceInfo);
       } catch (const DxvkError& e) {
-        m_gates.erase(resid);
+        m_gates.erase(generation);
         m_createFails.fetch_add(1u, std::memory_order_relaxed);
-        Logger::err(str::format("helios-acquire: gate fence creation failed for resid ",
-          resid, ": ", e.message()));
+        Logger::err(str::format("helios-acquire: gate fence creation failed for generation ",
+          generation, " resid ", resid, ": ", e.message()));
         return nullptr;
       }
 
+      gate.resid = resid;
       gate.lastSignaled = retired;
     }
 
@@ -311,28 +319,45 @@ namespace dxvk {
 
 
   void DxvkHeliosScanoutAcquire::processRetirements() {
-    DxvkHeliosLedgerSlot slots[8u] = { };
-    const uint32_t n = helios_acquire::ledgerSnapshot(slots, 8u);
-
+    // Serialize the snapshot with armFence. Taking the snapshot first would
+    // leave a publication race: a new generation could be armed after the
+    // snapshot but before this mutex, then look absent below and be signaled as
+    // if KMD had already recycled its quiescent claim. The UMD registry mutex
+    // taken by ledgerSnapshotV2 never nests this gate mutex on init/teardown:
+    // device init delivers the event only after init_for_device returns, and
+    // teardown joins this signaler before removing the registry entry.
     std::lock_guard<dxvk::mutex> lock(m_mutex);
+
+    DxvkHeliosLedgerSlot slots[65u] = { };
+    const uint32_t n = helios_acquire::ledgerSnapshotV2(slots, 65u);
 
     for (auto it = m_gates.begin(); it != m_gates.end(); ) {
       auto& gate = it->second;
 
       const DxvkHeliosLedgerSlot* slot = nullptr;
+      bool generationResidMismatch = false;
 
       for (uint32_t i = 0; i < n; i++) {
-        if (slots[i].resid == it->first) {
-          slot = &slots[i];
+        if (slots[i].generation == it->first) {
+          if (slots[i].resid == gate.resid)
+            slot = &slots[i];
+          else
+            generationResidMismatch = true;
           break;
         }
       }
 
-      // A vanished slot means every read of this resid retired (the KMD
-      // reclaims a slot only at issued == retired), and venus resource ids
-      // never recycle, so it is permanent: release everything armed, then
-      // drop the gate once it has caught up.
-      const uint64_t target = slot ? uint64_t(slot->retired) : gate.highestArmed;
+      if (generationResidMismatch) {
+        Logger::err(str::format("helios-acquire: snapshot generation ", it->first,
+          " expected resid ", gate.resid, " but observed another resid"));
+        ++it;
+        continue;
+      }
+
+      // A vanished generation may be released only because the KMD recycles a
+      // claim at `issued == retired`; no replacement generation can retire or
+      // signal this old gate.
+      const uint64_t target = slot ? slot->retired : gate.highestArmed;
 
       if (target > gate.lastSignaled)
         signalGateLocked(it->first, gate, target);
@@ -347,7 +372,7 @@ namespace dxvk {
   }
 
 
-  void DxvkHeliosScanoutAcquire::signalGateLocked(uint32_t resid, Gate& gate, uint64_t value) {
+  void DxvkHeliosScanoutAcquire::signalGateLocked(uint64_t generation, Gate& gate, uint64_t value) {
     // CPU-signal precedent: DxvkKeyedMutex::ReleaseSync. vkSignalSemaphore
     // requires a strictly increasing value; getValue() is the venus feedback
     // read (cheap, guest-side) and is the authority on what has been reached
@@ -365,8 +390,8 @@ namespace dxvk {
 
       if (vr != VK_SUCCESS) {
         m_signalFails.fetch_add(1u, std::memory_order_relaxed);
-        Logger::err(str::format("helios-acquire: vkSignalSemaphore(resid ", resid,
-          " -> ", value, ") failed: ", vr));
+        Logger::err(str::format("helios-acquire: vkSignalSemaphore(generation ", generation,
+          " resid ", gate.resid, " -> ", value, ") failed: ", vr));
       } else {
         m_signals.fetch_add(1u, std::memory_order_relaxed);
       }

@@ -201,10 +201,11 @@ namespace dxvk {
      * list on any still-in-flight host readback of the slot (the D4a acquire
      * as the snapshot-overwrite backstop).
      */
-    void HeliosCopyPresentSnapshot(
+    bool HeliosCopyPresentSnapshot(
       const Rc<DxvkImage>&        DstImage,
       const Rc<DxvkImage>&        SrcImage,
-            VkExtent3D            Extent);
+            VkExtent3D            Extent,
+            bool                  WindowedBltReservation);
 
     /**
      * \brief Helios: inject a command ordered after all recorded work
@@ -236,11 +237,15 @@ namespace dxvk {
     // the physical CS sequence above.
     uint64_t                m_heliosFlushChunkOffset = 0ull;
 
-    // A replay wrapper can own an entire deferred 16 KiB chunk. Keep the
-    // number of wrappers per immediate chunk bounded so high-priority CS
-    // work still gets a scheduling point at a fixed, small granularity.
+    // The default arm remains at 16 replay wrappers. The opt-in byte arm
+    // uses the same 256 KiB worst-case budget for full chunks, while its
+    // independent 256-wrapper ceiling bounds pathological tiny lists.
+    uint64_t                m_heliosInlineReplayBytes = 0ull;
     uint32_t                m_heliosInlineReplayChunkCount = 0u;
     static constexpr uint32_t MaxHeliosInlineReplayChunks = 16u;
+    static constexpr uint32_t MaxHeliosInlineReplayByteAccountingChunks = 256u;
+    static constexpr uint64_t MaxHeliosInlineReplayByteAccountingBytes
+      = uint64_t(MaxHeliosInlineReplayChunks) * DxvkCsChunkSize;
 
     uint32_t                m_mappedImageCount = 0u;
 

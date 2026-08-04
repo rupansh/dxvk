@@ -15,15 +15,16 @@ namespace dxvk {
   /**
    * \brief One KMD read-ledger slot (Helios D4a)
    *
-   * Snapshot form of the KMD's per-scanout-buffer host-readback ledger:
-   * \c issued counts RESOURCE_FLUSH readbacks enqueued for the venus resource,
-   * \c retired their terminal outcomes (every issue retires exactly once,
-   * enforced KMD-side by the flush token's Drop). resid 0 = free slot.
+   * A nonzero generation is the claim identity; `issued` counts reads for that
+   * claim and `retired` their terminal outcomes. `resid == 0` or generation 0
+   * means no valid slot.
    */
   struct DxvkHeliosLedgerSlot {
     uint32_t resid;
-    uint32_t issued;
-    uint32_t retired;
+    uint32_t pad0;
+    uint64_t generation;
+    uint64_t issued;
+    uint64_t retired;
   };
 
   /**
@@ -50,10 +51,11 @@ namespace dxvk {
      * overflow, or feature off) — the caller arms no wait, which is exactly
      * today's behavior.
      */
-    bool ledgerLookup(uint32_t resid, uint32_t* issued, uint32_t* retired);
+    bool ledgerLookupV2(
+      uint32_t resid, uint64_t* generation, uint64_t* issued, uint64_t* retired);
 
     /** Snapshots up to \c maxSlots slots; returns the count written. */
-    uint32_t ledgerSnapshot(DxvkHeliosLedgerSlot* slots, uint32_t maxSlots);
+    uint32_t ledgerSnapshotV2(DxvkHeliosLedgerSlot* slots, uint32_t maxSlots);
 
     /**
      * \brief Venus resource id backing a device memory object
@@ -69,13 +71,13 @@ namespace dxvk {
   /**
    * \brief Per-device scanout-reuse gate state (Helios D4a)
    *
-   * Owns the gate fences \c T_resid — one PLAIN INTERNAL timeline semaphore
+   * Owns the gate fences T_generation — one PLAIN INTERNAL timeline semaphore
    * per scan-out buffer, value space = the ledger's \c retired counter — and
    * the signaler thread that forwards ledger retirements onto them with
    * \c vkSignalSemaphore (CPU signal; DxvkKeyedMutex::ReleaseSync precedent).
    *
    * The emission side (DxvkContext::heliosEmitScanoutReuseWaits) arms
-   * \c waitFence(T_resid, issued) on the command list that re-writes a buffer
+   * `waitFence(T_generation, issued)` on the command list that re-writes a buffer
    * iff the ledger says a host readback of it is in flight; the wait is a
    * TOP_OF_PIPE VkSemaphoreSubmitInfo on that list's first vkQueueSubmit2 —
    * it parks the host GPU queue, never a guest CPU thread.
@@ -84,9 +86,10 @@ namespace dxvk {
    * event OR the 10 ms timeout) re-reads the whole ledger — so lost wakeups,
    * event-table overflow and registration races are a bounded hiccup, never a
    * hang; the ledger's advance is KMD-guaranteed (every issue retires by
-   * type). A vanished slot means every read retired (slots reclaim only at
-   * issued == retired, and venus resids never recycle), so its gate is
-   * released to the highest value ever armed and dropped.
+   * type). A vanished claim means every read retired (slots recycle only at
+   * `issued == retired`), so its generation-keyed gate is released to the
+   * highest value ever armed and dropped. The gate retains and validates resid
+   * for diagnostics; a recycled slot can never cross-signal an old generation.
    */
   class DxvkHeliosScanoutAcquire {
 
@@ -107,7 +110,7 @@ namespace dxvk {
     void setEventHandle(HANDLE event);
 
     /**
-     * \brief Gate fence for a resid, arming \c issued
+     * Gate fence for a generation-qualified resid, arming `issued`.
      *
      * Creates the fence lazily (initial value = \c retired read from the
      * ledger at creation) and starts the signaler with the first fence.
@@ -115,7 +118,8 @@ namespace dxvk {
      * \returns \c nullptr after shutdown or on creation failure — the caller
      *          skips the wait (runs ungated, counted).
      */
-    Rc<DxvkFence> armFence(uint32_t resid, uint32_t issued, uint32_t retired);
+    Rc<DxvkFence> armFence(
+      uint32_t resid, uint64_t generation, uint64_t issued, uint64_t retired);
 
     /**
      * \brief Teardown, spec §5.3 order
@@ -149,6 +153,7 @@ namespace dxvk {
 
     struct Gate {
       Rc<DxvkFence> fence;
+      uint32_t      resid = 0u;
       uint64_t      lastSignaled = 0u;
       uint64_t      highestArmed = 0u;
       high_resolution_clock::time_point armTime = { };
@@ -158,7 +163,7 @@ namespace dxvk {
 
     dxvk::mutex                         m_mutex;
     dxvk::condition_variable            m_cond;
-    std::unordered_map<uint32_t, Gate>  m_gates;
+    std::unordered_map<uint64_t, Gate>  m_gates;
 
     HANDLE                              m_event         = nullptr;
     dxvk::thread                        m_thread;
@@ -176,7 +181,7 @@ namespace dxvk {
 
     void processRetirements();
 
-    void signalGateLocked(uint32_t resid, Gate& gate, uint64_t value);
+    void signalGateLocked(uint64_t generation, Gate& gate, uint64_t value);
 
   };
 

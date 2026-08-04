@@ -53,13 +53,12 @@ namespace dxvk {
       // we could add a `int fd` here, etc.
       HANDLE handle = INVALID_HANDLE_VALUE;
     };
-    /// Helios KMT-mode typed import identity. When \c heliosResourceId is
-    /// nonzero on an Import-mode sharing info, the image imports the backing
-    /// venus memory by this resource id (no HANDLE punning), allocating with
-    /// the creator's exact allocation size and memory type as recorded by the
-    /// KMD's open-identity ABI — vkr's OPAQUE-fd import requires an exact-size
-    /// match, and the memory type must be one the host accepts for the
-    /// exported handle; the opener's own image requirements are neither.
+    /// Helios KMT-mode typed import identity. `heliosResourceId` is the exact creator Venus allocation identity:
+    /// The image imports backing memory by this resource id (no HANDLE
+    /// punning), allocating with the creator's exact allocation size and memory
+    /// type as recorded by the KMD's open-identity ABI — vkr's OPAQUE-fd import
+    /// requires an exact-size match, and the memory type must be one the host
+    /// accepts for the exported handle; the opener's own requirements are neither.
     uint32_t     heliosResourceId       = 0u;
     VkDeviceSize heliosAllocSize        = 0u;
     uint32_t     heliosMemoryTypeIndex  = ~0u;
@@ -610,10 +609,10 @@ namespace dxvk {
     /**
      * \brief Marks this exact backing allocation as a present-sync producer
      *
-     * The `(fence generation, Venus resource id)` pair is immutable for this
-     * publication. The marker is written only after its slot publication
-     * succeeded, then taken by the allocation destructor before it frees that
-     * memory.
+     * The `(fence generation, resource id)` tuple is
+     * immutable for this publication. The marker is written only after its HPS2
+     * slot publication succeeded, then taken by the allocation destructor
+     * before it frees that memory.
      */
     bool setHeliosPresentSlot(uint32_t resid, uint32_t fenceId) {
       if (!resid || !fenceId)
@@ -621,13 +620,24 @@ namespace dxvk {
 
       const uint64_t slot = (uint64_t(fenceId) << 32) | resid;
       uint64_t expected = 0u;
-      return m_heliosPresentSlot.compare_exchange_strong(expected, slot,
-        std::memory_order_release, std::memory_order_acquire)
-          || expected == slot;
+      if (m_heliosPresentSlot.compare_exchange_strong(expected, slot,
+          std::memory_order_release, std::memory_order_acquire)) {
+        return true;
+      }
+      return expected == slot;
     }
 
-    uint64_t takeHeliosPresentSlot() {
-      return m_heliosPresentSlot.exchange(0u, std::memory_order_acq_rel);
+    struct HeliosPresentSlot {
+      uint32_t resid;
+      uint32_t fenceId;
+    };
+
+    HeliosPresentSlot takeHeliosPresentSlot() {
+      const uint64_t slot = m_heliosPresentSlot.exchange(0u, std::memory_order_acq_rel);
+      return {
+        uint32_t(slot),
+        uint32_t(slot >> 32),
+      };
     }
 
     /**
@@ -855,6 +865,13 @@ namespace dxvk {
 
     ~DxvkLocalAllocationCache() {
       freeCache();
+    }
+
+    /**
+     * \brief Checks whether the cache supports any memory type
+     */
+    bool isUsable() const {
+      return m_memoryTypes != 0u;
     }
 
     /**
