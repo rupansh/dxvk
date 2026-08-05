@@ -4,6 +4,8 @@
 #include "../util/util_string.h"
 #include "../util/util_env.h"
 
+#include <aclapi.h>
+#include <sddl.h>
 #include <windows.h>
 
 #include <atomic>
@@ -17,6 +19,22 @@ namespace dxvk {
     constexpr uint32_t HpsMagic     = 0x32535048u; // 'HPS2'
     constexpr uint32_t HpsSlotCount = 4096u;
     constexpr uint32_t HpsFenceIdKwaitBit = 0x40000000u;
+    constexpr const char* HpsDefaultPath =
+      "C:\\ProgramData\\Helios\\helios_present_sync_v2.bin";
+
+    // HPS2 is written by ordinary D3D producers and read/written by two
+    // cross-principal consumers: dwm (Window Manager\DWM-N) and RDPIDD
+    // (WUDFHost as LOCAL SERVICE). ProgramData's inherited ACL only grants the
+    // latter read access, so a file first created by dwm makes every RDP read
+    // silently unordered. Keep the table private to authenticated local
+    // principals while granting the three identities that use it read/write.
+    constexpr const char* HpsDefaultSddl =
+      "D:P"
+      "(A;;GA;;;SY)"                  // Local System
+      "(A;;GA;;;BA)"                  // Built-in administrators
+      "(A;;GRGW;;;AU)"                // Interactive D3D producers
+      "(A;;GRGW;;;LS)"                // RDPIDD / WUDFHost
+      "(A;;GRGW;;;S-1-5-90-0)";       // Window Manager group
 
     struct HpsHeader {
       uint32_t magic;
@@ -55,21 +73,62 @@ namespace dxvk {
     std::once_flag g_mapOnce;
     std::once_flag g_reclaimOnce;
 
-    std::string mapPath() {
-      std::string path = env::getEnvVar("HELIOS_PRESENT_SYNC_PATH");
-      if (path.empty())
-        path = "C:\\ProgramData\\Helios\\helios_present_sync_v2.bin";
-      return path;
-    }
-
     void initMapping() {
-      const std::string path = mapPath();
+      std::string path = env::getEnvVar("HELIOS_PRESENT_SYNC_PATH");
+      const bool defaultPath = path.empty();
+      if (defaultPath)
+        path = HpsDefaultPath;
+
+      PSECURITY_DESCRIPTOR descriptor = nullptr;
+      SECURITY_ATTRIBUTES attributes = { };
+      SECURITY_ATTRIBUTES* createAttributes = nullptr;
+      DWORD aclRepairError = ERROR_SUCCESS;
+
+      if (defaultPath) {
+        if (::ConvertStringSecurityDescriptorToSecurityDescriptorA(
+              HpsDefaultSddl, SDDL_REVISION_1, &descriptor, nullptr)) {
+          attributes.nLength = sizeof(attributes);
+          attributes.lpSecurityDescriptor = descriptor;
+          attributes.bInheritHandle = FALSE;
+          createAttributes = &attributes;
+
+          // Security attributes only affect a newly-created file. Repair an
+          // HPS2 file left by an older build as well. The first dwm process is
+          // normally its owner and can update the DACL; the package installer
+          // performs the same repair before any graphics process starts.
+          BOOL daclPresent = FALSE;
+          BOOL daclDefaulted = FALSE;
+          PACL dacl = nullptr;
+          if (::GetSecurityDescriptorDacl(
+                descriptor, &daclPresent, &dacl, &daclDefaulted)
+           && daclPresent) {
+            aclRepairError = ::SetNamedSecurityInfoA(
+              const_cast<char*>(path.c_str()), SE_FILE_OBJECT,
+              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+              nullptr, nullptr, dacl, nullptr);
+            if (aclRepairError == ERROR_FILE_NOT_FOUND
+             || aclRepairError == ERROR_PATH_NOT_FOUND)
+              aclRepairError = ERROR_SUCCESS;
+          }
+        } else {
+          Logger::warn(str::format(
+            "HeliosPresentSync: could not build default file security: ",
+            ::GetLastError()));
+        }
+      }
+
       HANDLE file = ::CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        createAttributes, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+      const DWORD openError = ::GetLastError();
+      if (descriptor)
+        ::LocalFree(descriptor);
       if (file == INVALID_HANDLE_VALUE) {
         Logger::warn(str::format("HeliosPresentSync: CreateFile(", path,
-          ") failed: ", ::GetLastError()));
+          ") failed: ", openError,
+          aclRepairError != ERROR_SUCCESS
+            ? str::format(" (ACL repair failed: ", aclRepairError, ")")
+            : std::string()));
         return;
       }
 
