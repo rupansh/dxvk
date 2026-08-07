@@ -270,6 +270,7 @@ namespace dxvk {
         " scanoutTarget=", (m_info.heliosLinearScanoutTarget ? 1u : 0u),
         " directOptimal=", (m_info.heliosDirectOptimalScanout ? 1u : 0u),
         " crossContextOptimal=", (m_info.heliosCrossContextOptimal ? 1u : 0u),
+        " layout=", uint32_t(m_info.layout),
         " usage=0x", std::hex, uint32_t(m_info.usage),
         " flags=0x", uint32_t(m_info.flags), std::dec));
     }
